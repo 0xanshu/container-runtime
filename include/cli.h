@@ -20,6 +20,7 @@ typedef enum {
     SUBCMD_TOP,         /* NEW in 8a */
     SUBCMD_NETSTAT,     /* NEW in 8a */
     SUBCMD_PULL,        /* NEW in 8c */
+    SUBCMD_POLICY,      /* Phase 1 */
 } subcommand_t;
 
 /**
@@ -48,6 +49,9 @@ int cmd_cleanup(int argc, char *argv[]);
 int cmd_stats(int argc, char *argv[]);
 int cmd_top(int argc, char *argv[]);
 int cmd_netstat(int argc, char *argv[]);
+
+/* Phase 1: policy validation without running a container. */
+int cmd_policy(int argc, char *argv[]);
 
 /**
  * Print top-level usage (subcommand list + flag summary) to stderr.

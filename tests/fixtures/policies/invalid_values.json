@@ -1,0 +1,10 @@
+{
+  "policy": {
+    "name": "invalid-values"
+  },
+  "resources": {
+    "memory": 1024,
+    "cpu": 99.0,
+    "pids": -5
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "policy": {
+    "name": "minimal"
+  },
+  "resources": {
+    "memory": 104857600,
+    "pids": 25,
+    "timeout": 60
+  }
+}

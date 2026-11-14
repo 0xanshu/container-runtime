@@ -101,6 +101,23 @@ typedef struct {
     int         masked_count;
     char        readonly_paths[OCI_MAX_READONLY][OCI_MAX_PATH];
     int         readonly_count;
+
+    /* Phase 1 — policy-derived runtime settings.  Every field is
+     * zero-init safe: container_config_t cfg = {0} keeps timeout=0,
+     * grace=0, policy_mode=false, and leaves event logging disabled,
+     * so legacy invocations are unchanged.  policy_mode is set only
+     * when --policy was supplied; policy_apply() is never called
+     * otherwise. */
+    uint32_t timeout_seconds;           /* 0 = no wall-clock timeout */
+    uint32_t grace_period_seconds;      /* SIGTERM -> SIGKILL delay */
+    double   memory_warning_threshold;  /* 0.0-1.0 */
+    double   cpu_warning_threshold;     /* 0.0-1.0 */
+    uint32_t cpu_warning_duration_ms;
+    uint32_t watchdog_poll_interval_ms;
+    bool     event_log_enabled;
+    char     event_log_dir[PATH_MAX];
+    char     policy_name[64];
+    bool     policy_mode;
 } container_config_t;
 
 /**

@@ -1,0 +1,22 @@
+{
+  "policy": {
+    "name": "with-logging",
+    "version": "1.0",
+    "description": "Policy that exercises custom event logging"
+  },
+  "resources": {
+    "memory": "256M",
+    "cpu": 1.0,
+    "pids": 40,
+    "thresholds": {
+      "memory_warning": 0.85,
+      "cpu_warning": 0.75,
+      "cpu_warning_duration": 3,
+      "poll_interval_ms": 250
+    }
+  },
+  "logging": {
+    "enabled": true,
+    "log_dir": "/var/log/minicontainer/student-events"
+  }
+}

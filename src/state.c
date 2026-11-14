@@ -88,8 +88,9 @@ int mkdir_p(const char *path, mode_t mode) {
  * Replace Phase 7b's state_save body with this atomic version.
  * Signature unchanged — callers see no difference.
  *
- * The JSON-emit block ("fprintf(f, ...)" lines) is byte-for-byte the
- * shipped state.c serializer — INCLUDING the *_ns namespace key names.
+ * The JSON-emit block ("fprintf(f, ...)" lines) is the shipped
+ * state.c serializer plus Phase 1's policy_name/event_log_dir fields —
+ * INCLUDING the *_ns namespace key names.
  * (Phase 7b bug fix: find_key() is naive strstr, so a bare "pid" bool
  * key shadow-matches the top-level integer "pid".  Do not regress
  * this by "simplifying" the keys back.)  Only the surrounding I/O
@@ -150,6 +151,11 @@ int state_save(const container_state_t *s) {
         "  \"rootfs\":      \"%s\",\n"
         "  \"hostname\":    \"%s\",\n"
         "  \"cgroup_path\": \"%s\",\n"
+        /* Phase 1: policy metadata.  Empty strings for legacy runs;
+         * state_load treats them as optional so old state.json files
+         * remain readable. */
+        "  \"policy_name\":   \"%s\",\n"
+        "  \"event_log_dir\": \"%s\",\n"
         /* Phase 7b bug fix: namespace bool keys are suffixed _ns to
          * avoid colliding with top-level "pid" (the integer PID).
          * find_key uses naive strstr, so the "pid" bool would
@@ -165,6 +171,7 @@ int state_save(const container_state_t *s) {
         s->id, s->pid, s->started_at,
         s->command, s->argv_str,
         s->rootfs, s->hostname, s->cgroup_path,
+        s->policy_name, s->event_log_dir,
         s->enable_pid_namespace   ? "true" : "false",
         s->enable_mount_namespace ? "true" : "false",
         s->enable_uts_namespace   ? "true" : "false",
@@ -348,6 +355,12 @@ int state_load(const char *id, container_state_t *out) {
     extract_string(buf, "rootfs",      out->rootfs,      sizeof(out->rootfs));
     extract_string(buf, "hostname",    out->hostname,    sizeof(out->hostname));
     extract_string(buf, "cgroup_path", out->cgroup_path, sizeof(out->cgroup_path));
+    /* Phase 1 policy metadata — optional for backwards compatibility
+     * with state.json files written before this field existed. */
+    extract_string(buf, "policy_name",   out->policy_name,
+                   sizeof(out->policy_name));
+    extract_string(buf, "event_log_dir", out->event_log_dir,
+                   sizeof(out->event_log_dir));
 
     /* Namespaces block — each is "key": true/false inside "namespaces": {...}. */
     /* Phase 7b bug fix: read the disambiguated *_ns keys, not the

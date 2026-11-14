@@ -50,6 +50,10 @@ static void seed_state(container_state_t *s) {
     strncpy(s->veth_host_ip,      "10.0.0.1",   sizeof(s->veth_host_ip) - 1);
     strncpy(s->veth_container_ip, "10.0.0.2",   sizeof(s->veth_container_ip) - 1);
     strncpy(s->veth_netmask,      "24",         sizeof(s->veth_netmask) - 1);
+    /* Phase 1: policy metadata is part of the on-disk schema. */
+    strncpy(s->policy_name,   "student", sizeof(s->policy_name) - 1);
+    strncpy(s->event_log_dir, "/var/log/minicontainer/events",
+            sizeof(s->event_log_dir) - 1);
 }
 
 static int test_round_trip(void) {
@@ -91,6 +95,8 @@ static int test_round_trip(void) {
     CHECK(strcmp(a.veth_host_ip, b.veth_host_ip) == 0,           "veth_host_ip mismatch");
     CHECK(strcmp(a.veth_container_ip, b.veth_container_ip) == 0, "veth_container_ip mismatch");
     CHECK(strcmp(a.veth_netmask, b.veth_netmask) == 0,           "veth_netmask mismatch");
+    CHECK(strcmp(a.policy_name, b.policy_name) == 0,             "policy_name mismatch");
+    CHECK(strcmp(a.event_log_dir, b.event_log_dir) == 0,         "event_log_dir mismatch");
 
     state_remove(a.id);
     printf("PASS: test_round_trip\n");

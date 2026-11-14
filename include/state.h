@@ -38,6 +38,12 @@ typedef struct {
      * for flag-driven runs.  oci_state_save reads this to decide whether
      * to emit oci-state.json. */
     char bundle_path[PATH_MAX];
+
+    /* Phase 1 — policy metadata.  Empty for legacy runs.  These let
+     * later `logs` / `inspect` commands find a custom event-log
+     * directory without re-reading the policy file. */
+    char policy_name[64];
+    char event_log_dir[PATH_MAX];
 } container_state_t;
 
 typedef struct {

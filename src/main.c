@@ -39,6 +39,7 @@ int main(int argc, char *argv[]) {
         case SUBCMD_TOP:     return cmd_top    (argc - 1, argv + 1);  /* NEW in 8a */
         case SUBCMD_NETSTAT: return cmd_netstat(argc - 1, argv + 1);  /* NEW in 8a */
         case SUBCMD_PULL:    return cmd_pull   (argc - 1, argv + 1);  /* NEW in 8c */
+        case SUBCMD_POLICY:  return cmd_policy (argc - 1, argv + 1);  /* Phase 1 */
         case SUBCMD_UNKNOWN:
             break;  /* fall through to implicit-run logic below */
     }

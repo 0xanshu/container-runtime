@@ -1,0 +1,30 @@
+{
+  "policy": {
+    "name": "unknown-fields"
+  },
+  "resources": {
+    "memory": "128M",
+    "mystery_knob": 42
+  },
+  "security": {
+    "enable_hardening": true,
+    "blocked_syscalls": ["reboot", "kexec_load"],
+    "seccomp_profile": "default",
+    "filesystem": {
+      "readonly_paths": ["/etc/passwd"],
+      "masked_paths": ["/proc/kcore"]
+    },
+    "network": {
+      "allow_outbound": false,
+      "allowed_ports": [80, 443]
+    }
+  },
+  "logging": {
+    "enabled": true,
+    "log_seccomp_denials": true,
+    "level": "info"
+  },
+  "totally_unknown_section": {
+    "nested": [1, 2, 3]
+  }
+}

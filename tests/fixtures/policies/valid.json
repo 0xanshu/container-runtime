@@ -1,0 +1,26 @@
+{
+  "policy": {
+    "name": "valid",
+    "version": "1.0",
+    "description": "Standard workload policy"
+  },
+  "resources": {
+    "memory": "512M",
+    "cpu": 0.5,
+    "pids": 50,
+    "timeout": 300,
+    "grace_period": 10,
+    "thresholds": {
+      "memory_warning": 0.9,
+      "cpu_warning": 0.8,
+      "cpu_warning_duration": 5
+    }
+  },
+  "security": {
+    "enable_hardening": true
+  },
+  "logging": {
+    "enabled": true,
+    "log_dir": "/var/log/minicontainer/events"
+  }
+}

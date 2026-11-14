@@ -1,0 +1,8 @@
+{
+  "policy": {
+    "name": "pids-20"
+  },
+  "resources": {
+    "pids": 20
+  }
+}

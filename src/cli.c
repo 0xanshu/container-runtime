@@ -6,6 +6,7 @@
 #include "cleanup.h"
 #include "pty.h"
 #include "inspector.h"   /* Phase 8a: show_container_* live reports */
+#include "policy.h"      /* Phase 1: --policy, policy validate */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,7 @@ subcommand_t parse_subcommand(const char *arg) {
     if (strcmp(arg, "top") == 0)     return SUBCMD_TOP;      /* NEW in 8a */
     if (strcmp(arg, "netstat") == 0) return SUBCMD_NETSTAT;  /* NEW in 8a */
     if (strcmp(arg, "pull") == 0)    return SUBCMD_PULL;     /* NEW in 8c */
+    if (strcmp(arg, "policy") == 0)  return SUBCMD_POLICY;   /* Phase 1 */
     return SUBCMD_UNKNOWN;
 }
 
@@ -73,15 +75,15 @@ static int parse_volume(const char *spec, bind_mount_t *out) {
     return 0;
 }
 
-/* Parse a memory limit string ("100M" / "1G" / "512K"). Carried
- * forward from Phase 5 main.c — unchanged. */
+/* Parse a memory limit string ("100M" / "1G" / "512K").
+ * Phase 1 (P1.3): delegate to the shared parser so --memory and the
+ * policy file accept identical syntax (bytes, K/M/G/T, KB/MiB forms).
+ * Invalid input is treated as unlimited (0) to preserve the historical
+ * CLI behaviour of not rejecting odd values. */
 static size_t parse_memory_limit(const char *str) {
-    char *endptr;
-    double value = strtod(str, &endptr);
-    if (*endptr == 'K' || *endptr == 'k') return (size_t)(value * 1024);
-    if (*endptr == 'M' || *endptr == 'm') return (size_t)(value * 1024 * 1024);
-    if (*endptr == 'G' || *endptr == 'g') return (size_t)(value * 1024 * 1024 * 1024);
-    return (size_t)value;
+    uint64_t bytes = 0;
+    if (policy_parse_memory_string(str, &bytes) != 0) return 0;
+    return (size_t)bytes;
 }
 
 static long parse_cpu_limit(const char *str) {
@@ -116,6 +118,11 @@ static int parse_run_flags(int argc, char *argv[],
     cgroup_limits_t limits = {0};
     bool enable_cgroup = false;
 
+    /* Phase 1: track which cgroup flags were explicitly supplied so a
+     * zero value (e.g. --memory 0) can override a policy/bundle value.
+     * The old "non-zero means set" check could not express that. */
+    bool memory_set = false, cpu_set = false, pids_set = false;
+
     bool enable_network = false;
     char *net_host_ip = NULL, *net_container_ip = NULL, *net_netmask = NULL;
     bool no_nat = false;
@@ -136,21 +143,24 @@ static int parse_run_flags(int argc, char *argv[],
     static char *oci_argv[OCI_MAX_ARGS + 1];
     static char *oci_env[OCI_MAX_ENV + 1];
 
-    /* ---------- PRE-SCAN: find and apply --bundle BEFORE the getopt loop.
-     * CLI flags must override bundle fields REGARDLESS of where --bundle
-     * sits on the command line.  Parsing it inside the loop would let a
-     * bundle clobber an earlier flag, so apply it first and let the
-     * normal loop treat every flag as an override.  The 'B' case in the
-     * loop is then a no-op. ---------- */
+    /* ---------- PRE-SCAN: find --bundle and --policy BEFORE the getopt
+     * loop so they are honoured even when they appear after the
+     * positional command (getopt stops at the first non-option).  The
+     * bundle is translated immediately; the policy is applied later,
+     * once flag-derived base fields (rootfs, debug) have been staged,
+     * and before explicit CLI limits are merged so flags still win.
+     * The 'B' and 6 (--policy) cases in the loop are no-ops. ---------- */
     const char *bundle_dir = NULL;
+    const char *policy_path = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--bundle") == 0 && i + 1 < argc) {
             bundle_dir = argv[i + 1];
-            break;
-        }
-        if (strncmp(argv[i], "--bundle=", 9) == 0) {
+        } else if (strncmp(argv[i], "--bundle=", 9) == 0) {
             bundle_dir = argv[i] + 9;
-            break;
+        } else if (strcmp(argv[i], "--policy") == 0 && i + 1 < argc) {
+            policy_path = argv[i + 1];
+        } else if (strncmp(argv[i], "--policy=", 9) == 0) {
+            policy_path = argv[i] + 9;
         }
     }
     if (bundle_dir) {
@@ -186,6 +196,14 @@ static int parse_run_flags(int argc, char *argv[],
         *out_oci_envc = oci_cfg_storage.proc_env_count;
     }
 
+    /* ---------- Phase 1: apply --policy AFTER the bundle and AFTER the
+     * flag-derived base fields (rootfs, debug) are staged, but BEFORE the
+     * explicit CLI cgroup overrides below.  Precedence is defaults < OCI
+     * bundle < policy file < explicit CLI flags (D2).  policy_apply only
+     * fills fields the policy owns; bundle/flag rootfs and namespace
+     * fields are untouched.  Staging rootfs first is what lets a policy
+     * enable hardening for a `--rootfs` run (D4). ---------- */
+
     static struct option long_options[] = {
         {"debug",            no_argument,       NULL, 'd'},
         {"pid",              no_argument,       NULL, 'p'},
@@ -209,6 +227,7 @@ static int parse_run_flags(int argc, char *argv[],
         {"secure",           no_argument,       NULL, 'S'},      /* Phase 8b */
         {"init",             no_argument,       NULL,  5 },      /* Phase 8b+ (long-only) */
         {"bundle",           required_argument, NULL, 'B'},      /* Phase 8c */
+        {"policy",           required_argument, NULL,  6 },      /* Phase 1 (long-only) */
         {"env",              required_argument, NULL, 'e'},
         {"help",             no_argument,       NULL, 'h'},
         {0, 0, 0, 0}
@@ -228,15 +247,18 @@ static int parse_run_flags(int argc, char *argv[],
             case 'I': enable_ipc_namespace = true; break;
             case 'm':
                 limits.memory_limit = parse_memory_limit(optarg);
+                memory_set = true;
                 enable_cgroup = true;
                 break;
             case 'C':
                 limits.cpu_quota = parse_cpu_limit(optarg);
                 limits.cpu_period = 100000;
+                cpu_set = true;
                 enable_cgroup = true;
                 break;
             case 'P':
                 limits.pid_limit = atoi(optarg);
+                pids_set = true;
                 enable_cgroup = true;
                 break;
             case 'N': enable_network = true; break;
@@ -266,6 +288,9 @@ static int parse_run_flags(int argc, char *argv[],
                 break;
             case 'B':
                 /* --bundle: already applied by the pre-scan above. */
+                break;
+            case 6:
+                /* --policy: already applied by the pre-scan above. */
                 break;
             case 'e':
                 if (*env_count >= MAX_ENV_ENTRIES - 1) {
@@ -345,18 +370,50 @@ static int parse_run_flags(int argc, char *argv[],
     if (enable_ipc_namespace)  out_cfg->enable_ipc_namespace  = true;
     if (enable_network)        out_cfg->enable_network        = true;
     if (enable_overlay)        out_cfg->enable_overlay        = true;
+
+    /* Phase 1: load/validate/apply the policy now that bundle fields and
+     * flag-derived rootfs/debug are staged.  Explicit CLI cgroup values
+     * are merged immediately below, so they still win. */
+    if (policy_path) {
+        policy_t policy;
+        if (policy_load(policy_path, &policy) < 0) {
+            fprintf(stderr, "%s\n",
+                    policy.validation_error[0]
+                        ? policy.validation_error
+                        : "Invalid policy file");
+            return 1;
+        }
+        policy_print_warnings(&policy);
+        if (policy_apply(&policy, out_cfg) < 0) {
+            fprintf(stderr, "Failed to apply policy: %s\n", policy_path);
+            policy_free(&policy);
+            return 1;
+        }
+        policy_free(&policy);
+    }
+
     /* Cgroup limits merge PER FIELD so e.g. --pids doesn't wipe a
-     * bundle-provided memory limit. */
+     * bundle/policy-provided memory limit.  Phase 1: use presence
+     * tracking instead of "non-zero means set" so --memory 0 can
+     * explicitly clear a policy/bundle value. */
     if (enable_cgroup) {
-        if (limits.memory_limit)
+        if (memory_set)
             out_cfg->cgroup_limits.memory_limit = limits.memory_limit;
-        if (limits.cpu_quota) {
+        if (cpu_set) {
             out_cfg->cgroup_limits.cpu_quota  = limits.cpu_quota;
             out_cfg->cgroup_limits.cpu_period = limits.cpu_period;
         }
-        if (limits.pid_limit)
+        if (pids_set)
             out_cfg->cgroup_limits.pid_limit = limits.pid_limit;
-        out_cfg->enable_cgroup = true;
+    }
+    if (memory_set || cpu_set || pids_set) {
+        /* Recompute from the effective values: if the user explicitly
+         * zeroed every limit, disable the cgroup rather than leaving a
+         * policy-enabled but empty one. */
+        out_cfg->enable_cgroup =
+            (out_cfg->cgroup_limits.memory_limit != 0 ||
+             out_cfg->cgroup_limits.cpu_quota    != 0 ||
+             out_cfg->cgroup_limits.pid_limit    != 0);
     }
 
     /* Invariants, re-derived from the EFFECTIVE (bundle + flags) config. */
@@ -468,6 +525,12 @@ static void state_from_config(const container_config_t *cfg,
      * emit oci-state.json.  Empty for flag-driven runs. */
     strncpy(state->bundle_path, cfg->bundle_path,
             sizeof(state->bundle_path) - 1);
+
+    /* Phase 1: carry policy metadata for later logs/inspect lookups. */
+    strncpy(state->policy_name, cfg->policy_name,
+            sizeof(state->policy_name) - 1);
+    strncpy(state->event_log_dir, cfg->event_log_dir,
+            sizeof(state->event_log_dir) - 1);
 }
 
 int cmd_run(int argc, char *argv[]) {
@@ -1056,6 +1119,36 @@ int cmd_cleanup(int argc, char *argv[]) {
     return 0;
 }
 
+/*
+ * Phase 1: `policy validate <path>`.
+ *
+ * Loads and validates a policy without running a container.  Works
+ * unprivileged (no cgroup access is attempted).  Exit 0 = valid,
+ * 1 = invalid/missing with a printable message.
+ */
+int cmd_policy(int argc, char *argv[]) {
+    if (argc < 3 || strcmp(argv[1], "validate") != 0) {
+        fprintf(stderr, "Usage: minicontainer policy validate <path>\n");
+        return 1;
+    }
+
+    const char *path = argv[2];
+    policy_t policy;
+    if (policy_load(path, &policy) < 0) {
+        fprintf(stderr, "%s\n",
+                policy.validation_error[0]
+                    ? policy.validation_error
+                    : "Invalid policy file");
+        policy_free(&policy);
+        return 1;
+    }
+
+    policy_print_warnings(&policy);
+    printf("Policy %s is valid\n", path);
+    policy_free(&policy);
+    return 0;
+}
+
 void cli_usage(const char *progname) {
     fprintf(stderr, "Usage: %s <subcommand> [options] [args]\n\n", progname);
     fprintf(stderr, "Subcommands:\n");
@@ -1069,6 +1162,7 @@ void cli_usage(const char *progname) {
     fprintf(stderr, "  netstat  Show the container's network connections (-v for the table)\n");
     fprintf(stderr, "  list     List running containers\n");
     fprintf(stderr, "  cleanup  Remove stale state from crashed containers\n");
+    fprintf(stderr, "  policy   validate <path> — check a policy file without running\n");
     fprintf(stderr, "  pull     Download a whitelisted rootfs into a bundle (alpine, ubuntu)\n\n");
     fprintf(stderr, "Run-mode options (run | start):\n");
     fprintf(stderr, "  --debug                  Enable debug output\n");
@@ -1092,6 +1186,7 @@ void cli_usage(const char *progname) {
     fprintf(stderr, "  --secure                 Drop caps + NO_NEW_PRIVS + seccomp + RO /sys (Phase 8b)\n");
     fprintf(stderr, "  --init                   Run a PID-1 init shim (forward signals, reap zombies) (Phase 8b+)\n");
     fprintf(stderr, "  --bundle <dir>           Run an OCI bundle: <dir>/config.json + <dir>/rootfs/ (Phase 8c)\n");
+    fprintf(stderr, "  --policy <path>          Load a JSON policy file (Phase 1)\n");
     fprintf(stderr, "  --env KEY=VALUE          Set environment variable\n");
     fprintf(stderr, "  --help                   Show this help\n\n");
     fprintf(stderr, "Backwards compat: %s [options] <command> [args]\n", progname);

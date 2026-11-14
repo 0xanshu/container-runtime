@@ -1,0 +1,8 @@
+{
+  "policy": {
+    "name": "timeout-5s"
+  },
+  "resources": {
+    "timeout": 5
+  }
+}

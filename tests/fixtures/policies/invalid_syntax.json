@@ -1,0 +1,6 @@
+{
+  "policy": {
+    "name": "broken"
+  },
+  "resources": {
+    "memory": "512M"
