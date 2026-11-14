@@ -16,9 +16,11 @@
 #include <sys/mount.h>
 #include <sys/resource.h>
 #include <dirent.h>
+#include <time.h>
 #include "pty.h"
 #include "hardening.h"   // Phase 8b: drop_capabilities / apply_no_new_privs / apply_seccomp_filter
 #include "init.h"        // Phase 8b+: run_init_supervisor (--init PID-1 shim)
+#include "watchdog.h"    // Phase 2: wall-clock timeout + cgroup monitor
 
 #define STACK_SIZE (1024 * 1024)
 
@@ -365,9 +367,18 @@ void container_wait(container_result_t *result, bool enable_debug) {
 
     bool overlay_active = result->ctx.overlay_ctx.is_mounted;
 
-    /* Step 13: waitpid */
+    /* Step 13: waitpid.  Phase 2: stop the watchdog first so it cannot
+     * observe/reap state after waitpid and cannot escalate to SIGKILL
+     * for a child that has already been reaped.  Then take one final
+     * cgroup sample while the cgroup files still exist (container_cleanup
+     * removes the cgroup later). */
     int status;
-    if (waitpid(result->child_pid, &status, 0) < 0) {
+    int wait_rc = waitpid(result->child_pid, &status, 0);
+    if (result->watchdog) {
+        watchdog_stop(result->watchdog);
+        watchdog_finalize_stats(result->watchdog);
+    }
+    if (wait_rc < 0) {
         perror("waitpid");
         result->exit_status = -1;
         if (overlay_active) {
@@ -630,6 +641,11 @@ container_result_t container_start(const container_config_t *config) {
     }
     result.child_pid = pid;
 
+    /* P2.5: the timeout countdown starts at clone(2) success, not when
+     * the watchdog thread is eventually started after post-clone setup. */
+    struct timespec watchdog_start_time;
+    clock_gettime(CLOCK_MONOTONIC, &watchdog_start_time);
+
     if (config->enable_debug) printf("[parent] Child PID: %d\n", pid);
 
     /* Step 8: close fds the child now owns. */
@@ -756,6 +772,55 @@ container_result_t container_start(const container_config_t *config) {
         }
     }
 
+    /* Step 12c (Phase 2): start the parent-side watchdog only after the
+     * child is fully wired (user-ns map, net, cgroup, sync write, PTY
+     * handoff) and only in the parent.  Starting before clone would give
+     * the child a copy of the pthread state; detached runs deliberately
+     * get no watchdog (the parent exits immediately).  Failure to start
+     * is non-fatal: the container runs without timeout/monitoring. */
+    if (!config->detach &&
+        (config->timeout_seconds > 0 ||
+         (config->enable_cgroup &&
+          (config->event_log_enabled ||
+           config->memory_warning_threshold > 0.0 ||
+           config->cpu_warning_threshold > 0.0)))) {
+        watchdog_context_t *wd = calloc(1, sizeof(*wd));
+        if (!wd) {
+            fprintf(stderr, "[watchdog] Failed to allocate watchdog context\n");
+        } else {
+            wd->child_pid                 = pid;
+            wd->start_time                = watchdog_start_time;
+            wd->timeout_seconds           = config->timeout_seconds;
+            wd->grace_period_seconds      = config->grace_period_seconds;
+            wd->memory_warning_threshold  = config->memory_warning_threshold;
+            wd->cpu_warning_threshold     = config->cpu_warning_threshold;
+            wd->cpu_warning_duration_ms   = config->cpu_warning_duration_ms;
+            wd->poll_interval_ms          = config->watchdog_poll_interval_ms;
+            wd->event_log_enabled         = config->event_log_enabled;
+            wd->enable_debug              = config->enable_debug;
+            snprintf(wd->container_id, sizeof(wd->container_id), "%s",
+                     config->container_id);
+            snprintf(wd->event_log_dir, sizeof(wd->event_log_dir), "%s",
+                     config->event_log_dir);
+            if (config->enable_cgroup) {
+                snprintf(wd->cgroup_path, sizeof(wd->cgroup_path), "%s",
+                         result.ctx.cgroup_ctx.cgroup_path);
+            }
+            if (watchdog_start(wd) < 0) {
+                fprintf(stderr, "[watchdog] Failed to start watchdog: %s\n",
+                        wd->error_message);
+                watchdog_free(wd);
+            } else {
+                result.watchdog = wd;
+                if (config->enable_debug) {
+                    printf("[parent] Watchdog started (timeout=%us grace=%us)\n",
+                           (unsigned)config->timeout_seconds,
+                           (unsigned)config->grace_period_seconds);
+                }
+            }
+        }
+    }
+
     /* container_start ends here.  Steps 13-15 (waitpid + parse status +
      * teardown overlay) live in container_wait, which the caller invokes
      * separately so it can interleave a state-file write between launch
@@ -781,6 +846,14 @@ container_result_t container_exec(const container_config_t *config) {
 
 void container_cleanup(container_result_t *result) {
     if (!result) return;
+
+    /* Phase 2: defensively stop/free a watchdog that container_wait did
+     * not get to (e.g. a caller that skips wait after a successful
+     * start).  Idempotent: watchdog_free(NULL) and a second call are safe. */
+    if (result->watchdog) {
+        watchdog_free(result->watchdog);
+        result->watchdog = NULL;
+    }
 
     cleanup_net(&result->ctx.net_ctx, false);
     remove_cgroup(&result->ctx.cgroup_ctx, false);

@@ -132,6 +132,10 @@ typedef struct {
     void             *stack_ptr;
 } container_context_t;
 
+/* Phase 2 — forward declaration only (watchdog.h must never be included
+ * here: it is a leaf that may include core.h without a cycle). */
+struct watchdog_context;
+
 /**
  * Result of container_exec. Contains exit status plus the runtime
  * context needed for cleanup.
@@ -143,6 +147,10 @@ typedef struct {
     int   signal;
     container_context_t ctx;
     int pty_master_fd;
+    /* Phase 2: non-NULL only when a watchdog was started (foreground
+     * runs with a timeout and/or resource monitoring).  Owned by the
+     * result; container_cleanup() stops and frees it. */
+    struct watchdog_context *watchdog;
 } container_result_t;
 
 /**
@@ -178,7 +186,9 @@ container_result_t container_start(const container_config_t *config);
  *   - result->exited_normally = true on normal exit, false on signal
  *   - result->signal        = WTERMSIG(status) when killed by signal
  * Overlay teardown runs here (immediately after waitpid) because the
- * overlay's per-execution lifetime ends with the child.
+ * overlay's per-execution lifetime ends with the child.  Phase 2: the
+ * watchdog is stopped (and given one final cgroup sample) immediately
+ * after waitpid, before the cgroup directory is removed by cleanup.
  *
  * Caller is responsible for calling container_cleanup() afterward
  * (or for not calling it — cmd_start deliberately skips both wait
@@ -206,6 +216,7 @@ container_result_t container_exec(const container_config_t *config);
  * a zero-initialized result is a no-op.
  *
  * Cleans up (in reverse setup order):
+ *   - Phase 2 watchdog thread/context (if still present)
  *   - Host veth + iptables NAT rule (cleanup_net)
  *   - Cgroup directory (remove_cgroup)
  *   - Clone stack (free)

@@ -7,6 +7,7 @@
 #include "pty.h"
 #include "inspector.h"   /* Phase 8a: show_container_* live reports */
 #include "policy.h"      /* Phase 1: --policy, policy validate */
+#include "watchdog.h"    /* Phase 2: WATCHDOG_MAX_GRACE_SECONDS */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,6 +92,40 @@ static long parse_cpu_limit(const char *str) {
     return (long)(value * 100000);
 }
 
+/* Phase 2: strict non-negative integer parsing for --timeout and
+ * --grace-period.  Rejects negative values (strtoull silently wraps
+ * them), trailing garbage, and values above `max`. */
+static int parse_seconds_arg(const char *flag, const char *str,
+                             uint64_t max, uint32_t *out) {
+    if (!str || str[0] == '\0' || str[0] == '-') {
+        fprintf(stderr, "Invalid %s value '%s': must be a non-negative integer\n",
+                flag, str ? str : "");
+        return -1;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long long value = strtoull(str, &end, 10);
+    if (errno == ERANGE || end == str || *end != '\0') {
+        fprintf(stderr, "Invalid %s value '%s': must be a non-negative integer\n",
+                flag, str);
+        return -1;
+    }
+    if (value > max) {
+        if (max == UINT32_MAX) {
+            fprintf(stderr, "Invalid %s value '%s': too large\n", flag, str);
+        } else {
+            fprintf(stderr,
+                    "Invalid %s value '%s': must be between 0 and %llu seconds\n",
+                    flag, str, (unsigned long long)max);
+        }
+        return -1;
+    }
+
+    *out = (uint32_t)value;
+    return 0;
+}
+
 /* Shared by cmd_run and cmd_start. Returns 0 on success, non-zero
  * exit code on parse error. *out_cfg gets fully populated;
  * *out_custom_env is filled with --env values that the caller passes
@@ -126,6 +161,12 @@ static int parse_run_flags(int argc, char *argv[],
     bool enable_network = false;
     char *net_host_ip = NULL, *net_container_ip = NULL, *net_netmask = NULL;
     bool no_nat = false;
+
+    /* Phase 2: wall-clock timeout / grace.  Presence tracking lets
+     * --timeout 0 disable a policy timeout and lets --grace-period 0
+     * mean "SIGKILL immediately after SIGTERM". */
+    uint32_t timeout_value = 0, grace_value = 0;
+    bool timeout_set = false, grace_set = false;
 
     bool enable_pty = false;
     bool detach = false;
@@ -228,6 +269,8 @@ static int parse_run_flags(int argc, char *argv[],
         {"init",             no_argument,       NULL,  5 },      /* Phase 8b+ (long-only) */
         {"bundle",           required_argument, NULL, 'B'},      /* Phase 8c */
         {"policy",           required_argument, NULL,  6 },      /* Phase 1 (long-only) */
+        {"timeout",          required_argument, NULL,  7 },      /* Phase 2 (long-only) */
+        {"grace-period",     required_argument, NULL,  8 },      /* Phase 2 (long-only) */
         {"env",              required_argument, NULL, 'e'},
         {"help",             no_argument,       NULL, 'h'},
         {0, 0, 0, 0}
@@ -291,6 +334,21 @@ static int parse_run_flags(int argc, char *argv[],
                 break;
             case 6:
                 /* --policy: already applied by the pre-scan above. */
+                break;
+            case 7:
+                if (parse_seconds_arg("--timeout", optarg, UINT32_MAX,
+                                      &timeout_value) < 0) {
+                    return 1;
+                }
+                timeout_set = true;
+                break;
+            case 8:
+                if (parse_seconds_arg("--grace-period", optarg,
+                                      WATCHDOG_MAX_GRACE_SECONDS,
+                                      &grace_value) < 0) {
+                    return 1;
+                }
+                grace_set = true;
                 break;
             case 'e':
                 if (*env_count >= MAX_ENV_ENTRIES - 1) {
@@ -390,6 +448,19 @@ static int parse_run_flags(int argc, char *argv[],
             return 1;
         }
         policy_free(&policy);
+    }
+
+    /* Phase 2: explicit CLI timeout/grace values override the policy.
+     * A legacy --timeout without --grace-period gets the documented
+     * 10-second default; policy mode keeps the policy's grace (which may
+     * legitimately be 0). */
+    if (timeout_set) out_cfg->timeout_seconds = timeout_value;
+    if (grace_set) {
+        out_cfg->grace_period_seconds = grace_value;
+    } else if (!out_cfg->policy_mode &&
+               out_cfg->timeout_seconds > 0 &&
+               out_cfg->grace_period_seconds == 0) {
+        out_cfg->grace_period_seconds = 10;
     }
 
     /* Cgroup limits merge PER FIELD so e.g. --pids doesn't wipe a
@@ -757,6 +828,15 @@ int cmd_start(int argc, char *argv[]) {
         return 1;
     }
     cfg.detach = true;
+
+    /* Phase 2 / P2.20: a detached parent exits immediately, so no
+     * parent-side watchdog can survive to enforce a timeout.  Make the
+     * limitation explicit instead of silently ignoring it. */
+    if (cfg.timeout_seconds > 0) {
+        fprintf(stderr,
+                "Warning: --timeout is not enforced for detached containers "
+                "(foreground-only; use 'run' instead)\n");
+    }
 
     /* Container env. Phase 8c: bundle process.env first, then CLI --env
      * (CLI precedence).  Non-bundle runs (oci_env_count == 0) keep the
@@ -1187,8 +1267,12 @@ void cli_usage(const char *progname) {
     fprintf(stderr, "  --init                   Run a PID-1 init shim (forward signals, reap zombies) (Phase 8b+)\n");
     fprintf(stderr, "  --bundle <dir>           Run an OCI bundle: <dir>/config.json + <dir>/rootfs/ (Phase 8c)\n");
     fprintf(stderr, "  --policy <path>          Load a JSON policy file (Phase 1)\n");
+    fprintf(stderr, "  --timeout <seconds>      Wall-clock timeout, 0 = none (run only) (Phase 2)\n");
+    fprintf(stderr, "  --grace-period <seconds> SIGTERM->SIGKILL delay, default 10, max %d (Phase 2)\n",
+            WATCHDOG_MAX_GRACE_SECONDS);
     fprintf(stderr, "  --env KEY=VALUE          Set environment variable\n");
     fprintf(stderr, "  --help                   Show this help\n\n");
+    fprintf(stderr, "Timeout enforcement is foreground-only: `start` warns and ignores --timeout.\n");
     fprintf(stderr, "Backwards compat: %s [options] <command> [args]\n", progname);
     fprintf(stderr, "is equivalent to %s run [options] <command> [args].\n", progname);
 }

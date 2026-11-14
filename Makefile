@@ -42,7 +42,8 @@ HELPER_OBJS = $(BUILD_DIR)/core.o $(BUILD_DIR)/env.o \
               $(BUILD_DIR)/hardening.o \
               $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/oci.o $(BUILD_DIR)/pull.o \
-              $(BUILD_DIR)/policy.o $(BUILD_DIR)/policy_json.o
+              $(BUILD_DIR)/policy.o $(BUILD_DIR)/policy_json.o \
+              $(BUILD_DIR)/watchdog.o
 
 # Executables
 MINICONTAINER  = minicontainer
@@ -60,6 +61,7 @@ TEST_INIT      = test_init
 TEST_OCI       = test_oci
 TEST_PULL      = test_pull
 TEST_POLICY    = test_policy
+TEST_WATCHDOG  = test_watchdog
 
 # Default target
 .PHONY: all
@@ -158,11 +160,16 @@ $(TEST_POLICY): $(BUILD_DIR)/test_policy.o $(HELPER_OBJS) $(LIBPROCFS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_POLICY) successfully!"
 
+# Phase 2: watchdog timeout/grace/threshold tests (no root required)
+$(TEST_WATCHDOG): $(BUILD_DIR)/test_watchdog.o $(HELPER_OBJS) $(LIBPROCFS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	@echo "Built $(TEST_WATCHDOG) successfully!"
+
 # Build and run all tests
 .PHONY: test
 test: $(MINICONTAINER) $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TEST_NET) \
       $(TEST_STATE) $(TEST_BIND) $(TEST_CLI) $(TEST_HARDENING) $(TEST_INIT) $(TEST_OCI) \
-      $(TEST_PULL) $(TEST_POLICY)
+      $(TEST_PULL) $(TEST_POLICY) $(TEST_WATCHDOG)
 	@echo "=== Running Phase 7a core tests (bare_exec + pid_only, requires root) ==="
 	sudo ./$(TEST_CORE)
 	@echo ""
@@ -215,6 +222,15 @@ test: $(MINICONTAINER) $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(
 	@echo ""
 	@echo "=== Running Phase 1 policy CLI smoke tests (no root required) ==="
 	bash tests/test_policy_cli.sh
+	@echo ""
+	@echo "=== Running Phase 2 watchdog tests (no root required) ==="
+	./$(TEST_WATCHDOG)
+	@echo ""
+	@echo "=== Running Phase 2 timeout integration tests (no root required) ==="
+	bash tests/integration/test_timeout.sh
+	bash tests/integration/test_timeout_grace.sh
+	bash tests/integration/test_timeout_detached.sh
+	bash tests/integration/test_timeout_stress.sh
 
 # Build with debug symbols
 .PHONY: debug
@@ -283,7 +299,7 @@ clean:
 	@rm -rf $(BUILD_DIR)
 	@rm -f $(MINICONTAINER) $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TEST_NET) \
 	       $(TEST_STATE) $(TEST_BIND) $(TEST_CLI) $(TEST_HARDENING) $(TEST_INIT) $(TEST_OCI) $(TEST_PULL) \
-	       $(TEST_POLICY)
+	       $(TEST_POLICY) $(TEST_WATCHDOG)
 	@echo "Cleaned build artifacts"
 
 # Run example commands
