@@ -1,0 +1,569 @@
+// Note: _GNU_SOURCE is provided by the Makefile.
+#include "state.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <time.h>
+
+#define STATE_ROOT_SYSTEM "/run/minicontainer"
+
+void generate_container_id(char id_out[CONTAINER_ID_LEN + 1]) {
+    unsigned char bytes[6];
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) {
+        /* Fallback: time-based, less unique but never fails. */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        unsigned long mix = (unsigned long)ts.tv_sec ^ ts.tv_nsec;
+        snprintf(id_out, CONTAINER_ID_LEN + 1, "%012lx", mix & 0xFFFFFFFFFFFFul);
+        return;
+    }
+    if (read(fd, bytes, 6) != 6) {
+        close(fd);
+        /* Same fallback. */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        unsigned long mix = (unsigned long)ts.tv_sec ^ ts.tv_nsec;
+        snprintf(id_out, CONTAINER_ID_LEN + 1, "%012lx", mix & 0xFFFFFFFFFFFFul);
+        return;
+    }
+    close(fd);
+    for (int i = 0; i < 6; i++) {
+        snprintf(id_out + 2*i, 3, "%02x", bytes[i]);
+    }
+    id_out[CONTAINER_ID_LEN] = '\0';
+}
+
+const char *state_dir_root(void) {
+    static char buf[PATH_MAX];
+
+    if (geteuid() == 0) {
+        return STATE_ROOT_SYSTEM;
+    }
+
+    const char *xdg = getenv("XDG_RUNTIME_DIR");
+    if (xdg && xdg[0]) {
+        snprintf(buf, sizeof(buf), "%s/minicontainer", xdg);
+        return buf;
+    }
+
+    snprintf(buf, sizeof(buf), "/run/user/%u/minicontainer", getuid());
+    return buf;
+}
+
+void state_dir_path(const char *id, char *out, size_t size) {
+    snprintf(out, size, "%s/%s", state_dir_root(), id);
+}
+
+int mkdir_p(const char *path, mode_t mode) {
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, mode);   /* ignore EEXIST */
+            *p = '/';
+        }
+    }
+    /* Idempotent leaf: succeed if the final mkdir works OR the path
+     * already exists as a directory.  Without this, the second call to
+     * mkdir_p on the same path (and the first call when the leaf is
+     * present from a prior run) returns -1 with errno=EEXIST. */
+    if (mkdir(tmp, mode) == 0) return 0;
+    if (errno == EEXIST) {
+        struct stat st;
+        if (stat(tmp, &st) == 0 && S_ISDIR(st.st_mode)) return 0;
+    }
+    return -1;
+}
+
+/*
+ * Replace Phase 7b's state_save body with this atomic version.
+ * Signature unchanged — callers see no difference.
+ *
+ * The JSON-emit block ("fprintf(f, ...)" lines) is byte-for-byte the
+ * shipped state.c serializer — INCLUDING the *_ns namespace key names.
+ * (Phase 7b bug fix: find_key() is naive strstr, so a bare "pid" bool
+ * key shadow-matches the top-level integer "pid".  Do not regress
+ * this by "simplifying" the keys back.)  Only the surrounding I/O
+ * changes: write to a hidden tempfile, fflush + fsync, then rename(2).
+ *
+ * Deliberately KEPT from the Phase 7b version:
+ *   - the leading idempotent mkdir_p.  test_state.c calls state_save
+ *     directly without state_claim_id; after a claim it is a no-op.
+ *   - the trailing pidfile write (state.h contract: "state.json +
+ *     pidfile").  Best-effort plain write, unchanged — it is one
+ *     short line; the partial-read race lives in the multi-line JSON.
+ */
+int state_save(const container_state_t *s) {
+    if (s == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    char dir[PATH_MAX], tmp_path[PATH_MAX], final_path[PATH_MAX];
+    char pidfile[PATH_MAX];
+    state_dir_path(s->id, dir, sizeof(dir));
+    mkdir_p(dir, 0755);
+
+    /* Compose absolute paths inside dir.  Truncation here would mean
+     * state_dir_root() + id exceeded PATH_MAX, which the runtime can't
+     * recover from — bail and let the caller treat as save failure. */
+    int n;
+    n = snprintf(tmp_path, sizeof(tmp_path), "%s/.state.json.tmp", dir);
+    if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
+        fprintf(stderr, "state_save: tmp_path truncated for id %s\n", s->id);
+        return -1;
+    }
+    n = snprintf(final_path, sizeof(final_path), "%s/state.json", dir);
+    if (n < 0 || (size_t)n >= sizeof(final_path)) {
+        fprintf(stderr, "state_save: state_path truncated for id %s\n", s->id);
+        return -1;
+    }
+    n = snprintf(pidfile, sizeof(pidfile), "%s/pidfile", dir);
+    if (n < 0 || (size_t)n >= sizeof(pidfile)) {
+        fprintf(stderr, "state_save: pidfile path truncated for id %s\n", s->id);
+        return -1;
+    }
+
+    FILE *f = fopen(tmp_path, "w");
+    if (!f) {
+        perror("fopen(.state.json.tmp)");
+        return -1;
+    }
+
+    /* === BEGIN: byte-for-byte the shipped Phase 7b/8a JSON emit === */
+    fprintf(f,
+        "{\n"
+        "  \"id\":          \"%s\",\n"
+        "  \"pid\":         %d,\n"
+        "  \"started_at\":  \"%s\",\n"
+        "  \"command\":     \"%s\",\n"
+        "  \"argv\":        \"%s\",\n"
+        "  \"rootfs\":      \"%s\",\n"
+        "  \"hostname\":    \"%s\",\n"
+        "  \"cgroup_path\": \"%s\",\n"
+        /* Phase 7b bug fix: namespace bool keys are suffixed _ns to
+         * avoid colliding with top-level "pid" (the integer PID).
+         * find_key uses naive strstr, so the "pid" bool would
+         * otherwise shadow-match the int field. */
+        "  \"namespaces\": {\n"
+        "    \"pid_ns\":     %s,\n"
+        "    \"mount_ns\":   %s,\n"
+        "    \"uts_ns\":     %s,\n"
+        "    \"user_ns\":    %s,\n"
+        "    \"ipc_ns\":     %s,\n"
+        "    \"network_ns\": %s\n"
+        "  },\n",
+        s->id, s->pid, s->started_at,
+        s->command, s->argv_str,
+        s->rootfs, s->hostname, s->cgroup_path,
+        s->enable_pid_namespace   ? "true" : "false",
+        s->enable_mount_namespace ? "true" : "false",
+        s->enable_uts_namespace   ? "true" : "false",
+        s->enable_user_namespace  ? "true" : "false",
+        s->enable_ipc_namespace   ? "true" : "false",
+        s->enable_network         ? "true" : "false");
+
+    if (s->has_veth) {
+        fprintf(f,
+            "  \"veth\": {\n"
+            "    \"host\":         \"%s\",\n"
+            "    \"container\":    \"%s\",\n"
+            "    \"host_ip\":      \"%s\",\n"
+            "    \"container_ip\": \"%s\",\n"
+            "    \"netmask\":      \"%s\"\n"
+            "  }\n",
+            s->veth_host, s->veth_container,
+            s->veth_host_ip, s->veth_container_ip, s->veth_netmask);
+    } else {
+        fprintf(f, "  \"veth\": null\n");
+    }
+    fprintf(f, "}\n");
+    /* === END: byte-for-byte JSON emit === */
+
+    if (fflush(f) != 0 || fsync(fileno(f)) < 0) {
+        perror("fflush/fsync(.state.json.tmp)");
+        fclose(f);
+        unlink(tmp_path);
+        return -1;
+    }
+    fclose(f);
+
+    /* The atomic step: rename(2) is atomic on the same filesystem. */
+    if (rename(tmp_path, final_path) < 0) {
+        perror("rename(.state.json.tmp -> state.json)");
+        unlink(tmp_path);
+        return -1;
+    }
+    /* /run is tmpfs — no need to fsync the directory for durability. */
+
+    /* pidfile — unchanged from Phase 7b (best-effort plain write). */
+    FILE *pf = fopen(pidfile, "w");
+    if (pf) {
+        fprintf(pf, "%d\n", s->pid);
+        fclose(pf);
+    }
+
+    return 0;
+}
+
+/*
+ * NEW Phase 8b. Generate a container ID and create its state directory
+ * atomically. Retries up to 3 times on EEXIST.
+ *
+ * Calls mkdir_p for the parent (state_dir_root() may be a nested path
+ * like /run/user/<uid>/minicontainer), then a plain mkdir for the per-
+ * container leaf — the leaf mkdir is the one that surfaces EEXIST as
+ * a collision signal.
+ */
+int state_claim_id(char id_out[CONTAINER_ID_LEN+1]) {
+    /* mkdir_p the root once (idempotent). */
+    if (mkdir_p(state_dir_root(), 0755) < 0 && errno != EEXIST) {
+        perror("mkdir_p(state_dir_root)");
+        return -1;
+    }
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        generate_container_id(id_out);
+
+        char dir[PATH_MAX];
+        state_dir_path(id_out, dir, sizeof(dir));
+
+        /* mkdir() the per-container leaf. EEXIST = collision; retry. */
+        if (mkdir(dir, 0755) == 0) {
+            return 0;
+        }
+        if (errno != EEXIST) {
+            perror("mkdir(state_dir/<id>)");
+            return -1;
+        }
+        /* Collision — regenerate and try again. */
+    }
+
+    errno = EEXIST;
+    return -1;
+}
+
+/* Hand-rolled JSON parser. We don't link jansson/cJSON — the schema
+ * is fixed (state_save writes it), so a line-by-line key/value scan
+ * is sufficient. Three helpers do the heavy lifting:
+ *   - find_key() locates "key" in the buffer
+ *   - extract_string() reads the quoted value after a found key
+ *   - extract_int() and extract_bool() handle the non-string types
+ * Robust against missing optional fields. */
+
+static const char *find_key(const char *buf, const char *key) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    return strstr(buf, pat);
+}
+
+static int extract_string(const char *buf, const char *key,
+                          char *out, size_t out_size) {
+    const char *p = find_key(buf, key);
+    if (!p) return -1;
+    /* Skip past "key": to the opening quote of the value. */
+    p = strchr(p, ':');
+    if (!p) return -1;
+    p = strchr(p, '"');
+    if (!p) return -1;
+    p++;  /* past the opening quote */
+    const char *end = strchr(p, '"');
+    if (!end) return -1;
+    size_t len = (size_t)(end - p);
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return 0;
+}
+
+static int extract_int(const char *buf, const char *key, long *out) {
+    const char *p = find_key(buf, key);
+    if (!p) return -1;
+    p = strchr(p, ':');
+    if (!p) return -1;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    char *endp;
+    long val = strtol(p, &endp, 10);
+    if (endp == p) return -1;
+    *out = val;
+    return 0;
+}
+
+static int extract_bool(const char *buf, const char *key, bool *out) {
+    const char *p = find_key(buf, key);
+    if (!p) return -1;
+    p = strchr(p, ':');
+    if (!p) return -1;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (strncmp(p, "true", 4) == 0)  { *out = true;  return 0; }
+    if (strncmp(p, "false", 5) == 0) { *out = false; return 0; }
+    return -1;
+}
+
+int state_load(const char *id, container_state_t *out) {
+    if (!id || !out) return -1;
+
+    char dir[PATH_MAX], state_path[PATH_MAX];
+    state_dir_path(id, dir, sizeof(dir));
+    int path_n = snprintf(state_path, sizeof(state_path), "%s/state.json", dir);
+    if (path_n < 0 || (size_t)path_n >= sizeof(state_path)) {
+        fprintf(stderr, "state_load: state_path truncated for id %s\n", id);
+        return -1;
+    }
+
+    FILE *f = fopen(state_path, "r");
+    if (!f) return -1;
+
+    /* Read whole file into a buffer. State files are <2 KB in practice;
+     * 16 KB bounds the read with margin. */
+    char buf[16384];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) return -1;
+    buf[n] = '\0';
+
+    memset(out, 0, sizeof(*out));
+    long lval;
+
+    /* Required scalar fields. */
+    if (extract_string(buf, "id",          out->id,           sizeof(out->id))         < 0) return -1;
+    if (extract_int   (buf, "pid",         &lval)                                       < 0) return -1;
+    out->pid = (pid_t)lval;
+    if (extract_string(buf, "started_at",  out->started_at,   sizeof(out->started_at)) < 0) return -1;
+    if (extract_string(buf, "command",     out->command,      sizeof(out->command))    < 0) return -1;
+
+    /* Optional scalar fields — missing is OK, leave default. */
+    extract_string(buf, "argv",        out->argv_str,    sizeof(out->argv_str));
+    extract_string(buf, "rootfs",      out->rootfs,      sizeof(out->rootfs));
+    extract_string(buf, "hostname",    out->hostname,    sizeof(out->hostname));
+    extract_string(buf, "cgroup_path", out->cgroup_path, sizeof(out->cgroup_path));
+
+    /* Namespaces block — each is "key": true/false inside "namespaces": {...}. */
+    /* Phase 7b bug fix: read the disambiguated *_ns keys, not the
+     * collision-prone bare names.  See the serializer above. */
+    extract_bool(buf, "pid_ns",     &out->enable_pid_namespace);
+    extract_bool(buf, "mount_ns",   &out->enable_mount_namespace);
+    extract_bool(buf, "uts_ns",     &out->enable_uts_namespace);
+    extract_bool(buf, "user_ns",    &out->enable_user_namespace);
+    extract_bool(buf, "ipc_ns",     &out->enable_ipc_namespace);
+    extract_bool(buf, "network_ns", &out->enable_network);
+
+    /* Veth block — present only when network is active. */
+    out->has_veth = false;
+    if (find_key(buf, "host") && find_key(buf, "container_ip")) {
+        extract_string(buf, "host",         out->veth_host,         sizeof(out->veth_host));
+        extract_string(buf, "container",    out->veth_container,    sizeof(out->veth_container));
+        extract_string(buf, "host_ip",      out->veth_host_ip,      sizeof(out->veth_host_ip));
+        extract_string(buf, "container_ip", out->veth_container_ip, sizeof(out->veth_container_ip));
+        extract_string(buf, "netmask",      out->veth_netmask,      sizeof(out->veth_netmask));
+        out->has_veth = (out->veth_host[0] != '\0');
+    }
+
+    return 0;
+}
+
+int state_list(container_info_t *infos, int max_infos) {
+    const char *root = state_dir_root();
+    DIR *dir = opendir(root);
+    if (!dir) {
+        if (errno == ENOENT) return 0;   /* No state yet — that's fine. */
+        perror("opendir(state_root)");
+        return -1;
+    }
+
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL && count < max_infos) {
+        if (entry->d_name[0] == '.') continue;
+        /* Container IDs are 12 hex chars. */
+        if (strlen(entry->d_name) != CONTAINER_ID_LEN) continue;
+
+        container_state_t s = {0};
+        if (state_load(entry->d_name, &s) < 0) continue;
+
+        container_info_t *info = &infos[count++];
+        strncpy(info->id, s.id, CONTAINER_ID_LEN + 1);
+        info->pid = s.pid;
+        strncpy(info->started_at, s.started_at, sizeof(info->started_at));
+        /* container_info_t.command is intentionally smaller than
+         * container_state_t.command (64 vs PATH_MAX) — list output
+         * is column-constrained.  Truncate safely. */
+        strncpy(info->command, s.command, sizeof(info->command) - 1);
+        info->command[sizeof(info->command) - 1] = '\0';
+        info->alive = (kill(s.pid, 0) == 0);
+
+        /* Best-effort cgroup stats. memory.current is a single number
+         * in bytes; cpu.stat has multiple lines but we read usage_usec.
+         * Both are optional — leave 0 on any read failure (including
+         * the common case where enable_cgroup was false). */
+        info->memory_current = 0;
+        info->cpu_pct = 0;
+        if (s.cgroup_path[0]) {
+            char p[PATH_MAX];
+            int pn = snprintf(p, sizeof(p), "%s/memory.current", s.cgroup_path);
+            if (pn < 0 || (size_t)pn >= sizeof(p)) continue;
+            FILE *mf = fopen(p, "r");
+            if (mf) {
+                unsigned long long bytes = 0;
+                if (fscanf(mf, "%llu", &bytes) == 1) {
+                    info->memory_current = (size_t)bytes;
+                }
+                fclose(mf);
+            }
+            /* CPU percent is non-trivial: cpu.stat gives total usage,
+             * but "percent" requires two samples and a delta. For 7b
+             * we report the cumulative usec divided by uptime — a
+             * crude lifetime average rather than instantaneous percent.
+             * A real implementation would sample twice with a sleep
+             * in between. */
+            pn = snprintf(p, sizeof(p), "%s/cpu.stat", s.cgroup_path);
+            if (pn < 0 || (size_t)pn >= sizeof(p)) continue;
+            FILE *cf = fopen(p, "r");
+            if (cf) {
+                char line[128];
+                unsigned long long usage_usec = 0;
+                while (fgets(line, sizeof(line), cf)) {
+                    if (sscanf(line, "usage_usec %llu", &usage_usec) == 1)
+                        break;
+                }
+                fclose(cf);
+                /* Compute lifetime average: usage_usec / wall_usec_since_start. */
+                struct timespec now_ts;
+                clock_gettime(CLOCK_REALTIME, &now_ts);
+                /* Parse started_at (ISO 8601 UTC) back to time_t. */
+                struct tm start_tm = {0};
+                if (strptime(s.started_at, "%Y-%m-%dT%H:%M:%SZ", &start_tm)) {
+                    time_t start_t = timegm(&start_tm);
+                    long elapsed_sec = (long)now_ts.tv_sec - (long)start_t;
+                    if (elapsed_sec > 0) {
+                        unsigned long long elapsed_usec =
+                            (unsigned long long)elapsed_sec * 1000000ULL;
+                        info->cpu_pct = (int)((usage_usec * 100) / elapsed_usec);
+                    }
+                }
+            }
+        }
+    }
+    closedir(dir);
+    return count;
+}
+
+int state_remove(const char *id) {
+    char dir[PATH_MAX], path[PATH_MAX];
+    state_dir_path(id, dir, sizeof(dir));
+
+    /* Phase 8c: remove oci-state.json first (if present) — declared in
+     * state.h, defined below.  No-op for non-bundle containers. */
+    oci_state_remove(id);
+
+    /* Best-effort cleanup.  Each snprintf return is checked against the
+     * buffer size; on truncation (only possible with a pathologically
+     * long state_dir_root()+id, never reached in practice) we skip the
+     * unlink/rmdir rather than act on a truncated path.  Silent skip,
+     * not warning — state_remove runs on every container exit and the
+     * truncation path is unreachable. */
+    int n;
+    n = snprintf(path, sizeof(path), "%s/state.json", dir);
+    if (n > 0 && (size_t)n < sizeof(path)) unlink(path);
+    n = snprintf(path, sizeof(path), "%s/pidfile", dir);
+    if (n > 0 && (size_t)n < sizeof(path)) unlink(path);
+    n = snprintf(path, sizeof(path), "%s/logs/stdout.log", dir);
+    if (n > 0 && (size_t)n < sizeof(path)) unlink(path);
+    n = snprintf(path, sizeof(path), "%s/logs/stderr.log", dir);
+    if (n > 0 && (size_t)n < sizeof(path)) unlink(path);
+    n = snprintf(path, sizeof(path), "%s/logs", dir);
+    if (n > 0 && (size_t)n < sizeof(path)) rmdir(path);
+    rmdir(dir);
+    return 0;
+}
+
+/* ===== Phase 8c — OCI runc-compatible state file ===== */
+
+/* No timestamp helper needed: container_state_t.started_at already
+ * holds the container's start time in exactly the ISO-8601 form OCI's
+ * "created" field wants (state_from_config formats it with strftime).
+ * Regenerating it here with time(NULL) would make "created" drift
+ * forward on every re-save. */
+int oci_state_save(const container_state_t *s)
+{
+    if (!s || s->bundle_path[0] == '\0') return 0;  /* no bundle, no oci-state */
+
+    char dir[PATH_MAX], tmp_path[PATH_MAX], final_path[PATH_MAX];
+    state_dir_path(s->id, dir, sizeof(dir));
+
+    /* snprintf truncation checks — same hygiene as state_save. */
+    int n;
+    n = snprintf(tmp_path, sizeof(tmp_path), "%s/.oci-state.json.tmp", dir);
+    if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
+        fprintf(stderr, "oci_state_save: tmp_path truncated for id %s\n", s->id);
+        return -1;
+    }
+    n = snprintf(final_path, sizeof(final_path), "%s/oci-state.json", dir);
+    if (n < 0 || (size_t)n >= sizeof(final_path)) {
+        fprintf(stderr, "oci_state_save: final_path truncated for id %s\n", s->id);
+        return -1;
+    }
+
+    FILE *f = fopen(tmp_path, "w");
+    if (!f) {
+        perror("fopen(.oci-state.json.tmp)");
+        return -1;
+    }
+
+    /* Determine status. Phase 7b's state_t doesn't have an explicit
+     * status field; derive: pid > 0 + state_dir present = running. */
+    const char *status = (s->pid > 0) ? "running" : "stopped";
+
+    fprintf(f,
+        "{\n"
+        "    \"ociVersion\": \"1.0.2\",\n"
+        "    \"id\":         \"%s\",\n"
+        "    \"pid\":         %d,\n"
+        "    \"status\":     \"%s\",\n"
+        "    \"bundle\":     \"%s\",\n"
+        "    \"rootfs\":     \"%s\",\n"
+        "    \"created\":    \"%s\",\n"
+        "    \"owner\":      \"\"\n"
+        "}\n",
+        s->id, s->pid, status, s->bundle_path, s->rootfs, s->started_at);
+
+    if (fflush(f) != 0 || fsync(fileno(f)) < 0) {
+        perror("fflush/fsync(.oci-state.json.tmp)");
+        fclose(f);
+        unlink(tmp_path);
+        return -1;
+    }
+    fclose(f);
+
+    if (rename(tmp_path, final_path) < 0) {
+        perror("rename(.oci-state.json.tmp -> oci-state.json)");
+        unlink(tmp_path);
+        return -1;
+    }
+    return 0;
+}
+
+int oci_state_remove(const char *id)
+{
+    if (!id) return 0;
+    char dir[PATH_MAX], path[PATH_MAX];
+    state_dir_path(id, dir, sizeof(dir));
+    int n = snprintf(path, sizeof(path), "%s/oci-state.json", dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return 0;  /* unreachable; skip */
+    if (unlink(path) < 0 && errno != ENOENT) {
+        perror("unlink(oci-state.json)");
+        return -1;
+    }
+    return 0;
+}
