@@ -44,3 +44,11 @@ core
 # Temporary files
 *.tmp
 *.log
+
+design.md
+requirements.md
+tasks.md
+REPORT.md
+
+third_party/
+/.kiro
