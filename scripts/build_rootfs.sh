@@ -11,17 +11,36 @@ mkdir -p "$ROOTFS"/{bin,lib,lib64,proc,tmp,etc,etc/ssl/certs}
 BINS=(sh ls echo wc mount grep ps rm env cp chmod mknod cat mkdir hostname id ip ipcs ipcmk ipcrm curl python3 nano sleep)
 
 for bin in "${BINS[@]}"; do
-    cp "/bin/$bin" "$ROOTFS/bin/"
-done
-
-# Copy shared libraries
-for bin in "${BINS[@]}"; do
-    ldd "/bin/$bin" 2>/dev/null | grep "=> /" | awk '{print $3}' | \
-        xargs -I '{}' cp --update=none '{}' "$ROOTFS/lib/"
+    src=""
+    for p in "/bin/$bin" "/usr/bin/$bin" "/sbin/$bin" "/usr/sbin/$bin"; do
+        if [ -f "$p" ]; then
+            src="$p"
+            break
+        fi
+    done
+    if [ -z "$src" ]; then
+        src=$(which "$bin" 2>/dev/null || true)
+    fi
+    if [ -n "$src" ] && [ -f "$src" ]; then
+        cp "$src" "$ROOTFS/bin/$bin"
+        ldd "$src" 2>/dev/null | grep "=> /" | awk '{print $3}' | \
+            while IFS= read -r lib; do
+                [ -n "$lib" ] && [ -f "$lib" ] && cp -n "$lib" "$ROOTFS/lib/" 2>/dev/null || true
+            done
+    elif [[ "$bin" =~ ^(curl|python3|nano|ipcs|ipcmk|ipcrm)$ ]]; then
+        echo "note: optional binary '$bin' not installed on host, omitting from rootfs"
+    else
+        echo "warning: binary '$bin' not found" >&2
+    fi
 done
 
 # Dynamic linker
-cp /lib64/ld-linux-x86-64.so.2 "$ROOTFS/lib64/"
+for ld in /lib64/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2; do
+    if [ -r "$ld" ]; then
+        cp "$ld" "$ROOTFS/lib64/" 2>/dev/null || true
+        break
+    fi
+done
 
 # NSS modules for getaddrinfo (DNS via /etc/resolv.conf). These are
 # dlopen'd by glibc at runtime, so ldd does not pick them up. Without

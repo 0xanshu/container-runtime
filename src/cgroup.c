@@ -98,6 +98,10 @@ int setup_cgroup(cgroup_context_t *ctx, const cgroup_limits_t *limits,
             return -1;
         }
 
+        // Disable swap if available so workloads cannot swap to host disk to bypass memory limit
+        snprintf(path, sizeof(path), "%s/memory.swap.max", ctx->cgroup_path);
+        write_cgroup_file(path, "0", false);
+
         if (enable_debug) {
             printf("[cgroup] Memory limit: %zu bytes\n", limits->memory_limit);
         }

@@ -93,20 +93,30 @@ section "4. Mount namespace + private root filesystem"
 # Minimal fallback if scripts/build_rootfs.sh cannot find every host
 # binary it expects. Only sh/ls/cat/echo are actually needed by this demo.
 build_minimal_rootfs() {
-    local dest=./rootfs b src lib
+    local dest=./rootfs b src lib p
     rm -rf "$dest"
     mkdir -p "$dest"/bin "$dest"/lib "$dest"/lib64 "$dest"/proc "$dest"/tmp "$dest"/etc || return 1
     for b in sh ls cat echo sleep hostname id grep; do
-        src=$(command -v "$b" 2>/dev/null) || continue
-        cp "$src" "$dest/bin/" || return 1
+        src=""
+        for p in "/bin/$b" "/usr/bin/$b" "/sbin/$b" "/usr/sbin/$b"; do
+            if [ -f "$p" ]; then
+                src="$p"
+                break
+            fi
+        done
+        if [ -z "$src" ]; then
+            src=$(which "$b" 2>/dev/null || true)
+        fi
+        [ -n "$src" ] && [ -f "$src" ] || continue
+        cp "$src" "$dest/bin/$b" || return 1
         while IFS= read -r lib; do
-            [ -n "$lib" ] || continue
+            [ -n "$lib" ] && [ -f "$lib" ] || continue
             cp -n "$lib" "$dest/lib/" 2>/dev/null || true
         done < <(ldd "$src" 2>/dev/null | awk '/=> \// {print $3} /ld-linux/ {print $1}')
     done
     for lib in /lib64/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2; do
         if [ -r "$lib" ]; then
-            cp "$lib" "$dest/lib64/" || return 1
+            cp "$lib" "$dest/lib64/" 2>/dev/null || true
             break
         fi
     done
@@ -261,10 +271,14 @@ show "$MC" list
 
 # ------------------------------------------------------------------
 section "9. Hardening — dropped capabilities, seccomp, no_new_privs"
-show "$MC" run --secure --pid /bin/sh -c \
-    'grep -E "^(CapEff|CapBnd|NoNewPrivs|Seccomp):" /proc/self/status'
-note "CapEff/CapBnd are a small subset of the host's"
-note "Seccomp: 2 means a filter is installed; NoNewPrivs: 1 blocks setuid escalation"
+if [ "$rootfs_ok" -eq 1 ]; then
+    show "$MC" run --secure --rootfs ./rootfs --pid /bin/sh -c \
+        'grep -E "^(CapEff|CapBnd|NoNewPrivs|Seccomp):" /proc/self/status'
+    note "CapEff/CapBnd are a small subset of the host's"
+    note "Seccomp: 2 means a filter is installed; NoNewPrivs: 1 blocks setuid escalation"
+else
+    note "Section 9 needs ./rootfs for --secure — skipped"
+fi
 
 # ------------------------------------------------------------------
 section "10. Cleanup"

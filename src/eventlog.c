@@ -128,9 +128,7 @@ static bool jb_kv_bool(json_buf_t *jb, bool *first, const char *key,
 /* Finalize details; on overflow fall back to a still-valid object. */
 static void event_finish(event_t *out, json_buf_t *jb)
 {
-    if (!jb->overflow && jb_append(jb, "}")) {
-        snprintf(out->details, sizeof(out->details), "%s", jb->buf);
-    } else {
+    if (jb->overflow || !jb_append(jb, "}")) {
         snprintf(out->details, sizeof(out->details),
                  "{\"truncated\":true}");
         out->truncated = true;
