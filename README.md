@@ -1,11 +1,6 @@
 # minicontainer
 
-> A lightweight, production-grade container runtime built from first principles in C using raw Linux system calls.
-
-[![Phase](https://img.shields.io/badge/Phase-3%20Secure%20Workload-blue)]()
-[![OCI Compliance](https://img.shields.io/badge/OCI-Runtime%20Spec%20Subset-purple)]()
-[![C Standard](https://img.shields.io/badge/C-C11-orange)]()
-[![License](https://img.shields.io/badge/License-MIT-green)]()
+A lightweight, production-grade container runtime built from first principles in C using raw Linux system calls.
 
 ---
 
