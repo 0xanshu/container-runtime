@@ -31,6 +31,8 @@ static int test_known_subcommands(void) {
     CHECK(parse_subcommand("cleanup"), SUBCMD_CLEANUP);
     CHECK(parse_subcommand("pull"),    SUBCMD_PULL);     /* Phase 8c */
     CHECK(parse_subcommand("policy"),  SUBCMD_POLICY);   /* Phase 1 */
+    CHECK(parse_subcommand("logs"),    SUBCMD_LOGS);     /* Phase 3 */
+    CHECK(parse_subcommand("events"),  SUBCMD_EVENTS);   /* Phase 3 */
     printf("PASS: test_known_subcommands\n");
     return 0;
 }

@@ -21,6 +21,7 @@
 #include "hardening.h"   // Phase 8b: drop_capabilities / apply_no_new_privs / apply_seccomp_filter
 #include "init.h"        // Phase 8b+: run_init_supervisor (--init PID-1 shim)
 #include "watchdog.h"    // Phase 2: wall-clock timeout + cgroup monitor
+#include "eventlog.h"    // Phase 3: JSONL audit events
 
 #define STACK_SIZE (1024 * 1024)
 
@@ -351,6 +352,96 @@ static int child_func(void *arg)
     return 127;
 }
 
+/** Phase 3: turn an event-log failure into a single warning and disable
+ * logging for the rest of this run.  Non-fatal by design (NFR2). */
+static void event_log_disable(container_result_t *result,
+                              const char *operation, int err)
+{
+    if (!result->event_log_warned) {
+        fprintf(stderr,
+                "[eventlog] warning: %s failed for container %s (%s): %s; "
+                "event logging disabled for this run\n",
+                operation,
+                result->container_id[0] ? result->container_id : "(unknown)",
+                result->event_log_dir[0] ? result->event_log_dir : "(no dir)",
+                strerror(err ? err : EIO));
+        result->event_log_warned = true;
+    }
+    result->event_log_enabled = false;
+}
+
+/* Phase 3: emit container_start after clone succeeded and (when used)
+ * cgroup membership was established.  Never called for legacy runs. */
+static void log_container_start_event(const container_config_t *config,
+                                      container_result_t *result)
+{
+    if (!result->event_log_enabled) return;
+
+    if (eventlog_init(result->event_log_dir, result->container_id) < 0) {
+        event_log_disable(result, "eventlog_init", errno);
+        return;
+    }
+
+    double cpu_limit = 0.0;
+    if (config->cgroup_limits.cpu_quota > 0 &&
+        config->cgroup_limits.cpu_period > 0) {
+        cpu_limit = (double)config->cgroup_limits.cpu_quota /
+                    (double)config->cgroup_limits.cpu_period;
+    }
+
+    event_t event;
+    event_container_start(&event, result->container_id, config->program,
+                          config->argv, result->policy_name, getuid(),
+                          (uint64_t)config->cgroup_limits.memory_limit,
+                          cpu_limit,
+                          (int64_t)config->cgroup_limits.pid_limit,
+                          config->timeout_seconds);
+
+    if (eventlog_append(result->event_log_dir, result->container_id,
+                        &event) < 0) {
+        event_log_disable(result, "container_start", errno);
+    }
+}
+
+/* Phase 3: emit oom_kill (when detected) and container_exit.  Called
+ * after waitpid + final cgroup sample, before container_cleanup()
+ * removes the cgroup.  Logging failures never change the exit status. */
+static void log_container_exit_events(container_result_t *result,
+                                      int exit_code, const char *exit_reason,
+                                      double wall_seconds, double cpu_seconds,
+                                      uint64_t memory_peak_bytes, bool oom)
+{
+    if (!result->event_log_enabled) return;
+
+    if (oom) {
+        event_t oom_event;
+        event_oom_kill(&oom_event, result->container_id,
+                       result->memory_limit_bytes, memory_peak_bytes,
+                       exit_code);
+        if (eventlog_append(result->event_log_dir, result->container_id,
+                            &oom_event) < 0) {
+            event_log_disable(result, "oom_kill", errno);
+            return;
+        }
+    }
+
+    event_t exit_event;
+    event_container_exit(&exit_event, result->container_id, exit_code,
+                         exit_reason, wall_seconds, cpu_seconds,
+                         memory_peak_bytes);
+    if (eventlog_append(result->event_log_dir, result->container_id,
+                        &exit_event) < 0) {
+        event_log_disable(result, "container_exit", errno);
+    }
+}
+
+static double monotonic_diff_seconds(const struct timespec *later,
+                                     const struct timespec *earlier)
+{
+    return (double)(later->tv_sec - earlier->tv_sec) +
+           (double)(later->tv_nsec - earlier->tv_nsec) / 1e9;
+}
+
 /**
  * Phase 7b: parent-side waitpid + overlay teardown.  Companion to
  * container_start.  Steps 13-15 of the original Phase 7a
@@ -367,13 +458,16 @@ void container_wait(container_result_t *result, bool enable_debug) {
 
     bool overlay_active = result->ctx.overlay_ctx.is_mounted;
 
-    /* Step 13: waitpid.  Phase 2: stop the watchdog first so it cannot
+    /* Step 13: wait4.  Phase 2: stop the watchdog first so it cannot
      * observe/reap state after waitpid and cannot escalate to SIGKILL
      * for a child that has already been reaped.  Then take one final
      * cgroup sample while the cgroup files still exist (container_cleanup
-     * removes the cgroup later). */
-    int status;
-    int wait_rc = waitpid(result->child_pid, &status, 0);
+     * removes the cgroup later).  wait4 also gives us the child's CPU
+     * time for the Phase 3 container_exit event when no cgroup exists. */
+    int status = 0;
+    struct rusage ru;
+    memset(&ru, 0, sizeof(ru));
+    int wait_rc = wait4(result->child_pid, &status, 0, &ru);
     if (result->watchdog) {
         watchdog_stop(result->watchdog);
         watchdog_finalize_stats(result->watchdog);
@@ -404,6 +498,70 @@ void container_wait(container_result_t *result, bool enable_debug) {
         }
     }
 
+    /* Phase 3: final accounting + audit events.  Stats were sampled by
+     * watchdog_finalize_stats() above, while the cgroup files still
+     * exist.  Exit reason precedence is timeout > oom > signal > normal
+     * (D9).  Logging here is the last chance before cleanup removes the
+     * cgroup, and every failure is downgraded to a warning. */
+    watchdog_stats_t stats;
+    memset(&stats, 0, sizeof(stats));
+    if (result->watchdog) {
+        watchdog_get_stats(result->watchdog, &stats);
+    }
+
+    struct timespec completed;
+    clock_gettime(CLOCK_MONOTONIC, &completed);
+    double wall_seconds = 0.0;
+    if (result->start_time.tv_sec != 0 || result->start_time.tv_nsec != 0) {
+        wall_seconds = monotonic_diff_seconds(&completed, &result->start_time);
+        if (wall_seconds < 0.0) wall_seconds = 0.0;
+    }
+
+    double cpu_seconds =
+        (double)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) +
+        (double)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+    if (stats.cpu_usage_usec > 0) {
+        cpu_seconds = (double)stats.cpu_usage_usec / 1e6;
+    }
+
+    uint64_t memory_peak_bytes = stats.memory_peak_bytes;
+    if (memory_peak_bytes == 0 && ru.ru_maxrss > 0) {
+#ifdef __linux__
+        memory_peak_bytes = (uint64_t)ru.ru_maxrss * 1024ULL;
+#else
+        memory_peak_bytes = (uint64_t)ru.ru_maxrss;
+#endif
+    }
+
+    bool oom = stats.oom_detected || stats.oom_kill_count > 0;
+    result->oom_detected       = oom;
+    result->wall_clock_seconds = wall_seconds;
+    result->cpu_time_seconds   = cpu_seconds;
+    result->memory_peak_bytes  = memory_peak_bytes;
+
+    bool timed_out = false;
+    if (result->watchdog) {
+        timed_out = watchdog_was_timeout_killed(result->watchdog);
+    }
+
+    const char *exit_reason = "normal";
+    if (timed_out) {
+        exit_reason = "timeout";
+    } else if (oom) {
+        exit_reason = "oom";
+    } else if (!result->exited_normally) {
+        exit_reason = "signal";
+    }
+
+    if (stats.event_log_failed) {
+        /* The watchdog already warned once; do not repeat it here. */
+        result->event_log_enabled = false;
+        result->event_log_warned  = true;
+    }
+    log_container_exit_events(result, result->exit_status, exit_reason,
+                              wall_seconds, cpu_seconds, memory_peak_bytes,
+                              oom);
+
     /* Step 15: teardown overlay (cgroup + net deferred to container_cleanup) */
     if (overlay_active) {
         teardown_overlay(&result->ctx.overlay_ctx, enable_debug);
@@ -423,6 +581,23 @@ container_result_t container_start(const container_config_t *config) {
         result.child_pid = -1;
         return result;
     }
+
+    /* Phase 3: snapshot event-log identity/state before any setup.  All
+     * fields stay zero for legacy runs, so no log is opened and no
+     * event is emitted unless policy/CLI enabled logging. */
+    snprintf(result.container_id, sizeof(result.container_id), "%s",
+             config->container_id);
+    snprintf(result.policy_name, sizeof(result.policy_name), "%s",
+             config->policy_name);
+    result.event_log_enabled = config->event_log_enabled;
+    if (config->event_log_dir[0] != '\0') {
+        snprintf(result.event_log_dir, sizeof(result.event_log_dir), "%s",
+                 config->event_log_dir);
+    } else if (result.event_log_enabled) {
+        snprintf(result.event_log_dir, sizeof(result.event_log_dir), "%s",
+                 EVENTLOG_DEFAULT_DIR);
+    }
+    result.memory_limit_bytes = (uint64_t)config->cgroup_limits.memory_limit;
 
     if (config->enable_debug) {
         printf("[parent] Executing: %s", config->program);
@@ -645,6 +820,7 @@ container_result_t container_start(const container_config_t *config) {
      * the watchdog thread is eventually started after post-clone setup. */
     struct timespec watchdog_start_time;
     clock_gettime(CLOCK_MONOTONIC, &watchdog_start_time);
+    result.start_time = watchdog_start_time;
 
     if (config->enable_debug) printf("[parent] Child PID: %d\n", pid);
 
@@ -772,6 +948,13 @@ container_result_t container_start(const container_config_t *config) {
         }
     }
 
+    /* Step 12c-pre (Phase 3): user-ns mapping, network setup, cgroup
+     * membership, sync write, and PTY handoff are complete, so the
+     * container genuinely launched.  Record container_start now, before
+     * the watchdog thread exists, so an event-log failure can be
+     * reflected in the watchdog context without a concurrent write. */
+    log_container_start_event(config, &result);
+
     /* Step 12c (Phase 2): start the parent-side watchdog only after the
      * child is fully wired (user-ns map, net, cgroup, sync write, PTY
      * handoff) and only in the parent.  Starting before clone would give
@@ -781,7 +964,7 @@ container_result_t container_start(const container_config_t *config) {
     if (!config->detach &&
         (config->timeout_seconds > 0 ||
          (config->enable_cgroup &&
-          (config->event_log_enabled ||
+          (result.event_log_enabled ||
            config->memory_warning_threshold > 0.0 ||
            config->cpu_warning_threshold > 0.0)))) {
         watchdog_context_t *wd = calloc(1, sizeof(*wd));
@@ -796,12 +979,12 @@ container_result_t container_start(const container_config_t *config) {
             wd->cpu_warning_threshold     = config->cpu_warning_threshold;
             wd->cpu_warning_duration_ms   = config->cpu_warning_duration_ms;
             wd->poll_interval_ms          = config->watchdog_poll_interval_ms;
-            wd->event_log_enabled         = config->event_log_enabled;
+            wd->event_log_enabled         = result.event_log_enabled;
             wd->enable_debug              = config->enable_debug;
             snprintf(wd->container_id, sizeof(wd->container_id), "%s",
                      config->container_id);
             snprintf(wd->event_log_dir, sizeof(wd->event_log_dir), "%s",
-                     config->event_log_dir);
+                     result.event_log_dir);
             if (config->enable_cgroup) {
                 snprintf(wd->cgroup_path, sizeof(wd->cgroup_path), "%s",
                          result.ctx.cgroup_ctx.cgroup_path);

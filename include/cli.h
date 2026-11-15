@@ -21,6 +21,8 @@ typedef enum {
     SUBCMD_NETSTAT,     /* NEW in 8a */
     SUBCMD_PULL,        /* NEW in 8c */
     SUBCMD_POLICY,      /* Phase 1 */
+    SUBCMD_LOGS,        /* Phase 3 */
+    SUBCMD_EVENTS,      /* Phase 3 */
 } subcommand_t;
 
 /**
@@ -52,6 +54,10 @@ int cmd_netstat(int argc, char *argv[]);
 
 /* Phase 1: policy validation without running a container. */
 int cmd_policy(int argc, char *argv[]);
+
+/* Phase 3: event log query commands. */
+int cmd_logs(int argc, char *argv[]);
+int cmd_events(int argc, char *argv[]);
 
 /**
  * Print top-level usage (subcommand list + flag summary) to stderr.

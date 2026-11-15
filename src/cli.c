@@ -8,6 +8,7 @@
 #include "inspector.h"   /* Phase 8a: show_container_* live reports */
 #include "policy.h"      /* Phase 1: --policy, policy validate */
 #include "watchdog.h"    /* Phase 2: WATCHDOG_MAX_GRACE_SECONDS */
+#include "eventlog.h"    /* Phase 3: --event-log, logs/events */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,8 @@
 #include <time.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
+#include <ctype.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 
@@ -34,6 +37,8 @@ subcommand_t parse_subcommand(const char *arg) {
     if (strcmp(arg, "netstat") == 0) return SUBCMD_NETSTAT;  /* NEW in 8a */
     if (strcmp(arg, "pull") == 0)    return SUBCMD_PULL;     /* NEW in 8c */
     if (strcmp(arg, "policy") == 0)  return SUBCMD_POLICY;   /* Phase 1 */
+    if (strcmp(arg, "logs") == 0)    return SUBCMD_LOGS;     /* Phase 3 */
+    if (strcmp(arg, "events") == 0)  return SUBCMD_EVENTS;   /* Phase 3 */
     return SUBCMD_UNKNOWN;
 }
 
@@ -168,6 +173,12 @@ static int parse_run_flags(int argc, char *argv[],
     uint32_t timeout_value = 0, grace_value = 0;
     bool timeout_set = false, grace_set = false;
 
+    /* Phase 3: --event-log / --no-event-log.  Presence tracking matters:
+     * --event-log must enable logging even when a policy disabled it, and
+     * --no-event-log must disable it even when a policy enabled it. */
+    const char *event_log_path = NULL;
+    bool event_log_set = false, no_event_log_set = false;
+
     bool enable_pty = false;
     bool detach = false;
     bool enable_init = false;
@@ -271,6 +282,8 @@ static int parse_run_flags(int argc, char *argv[],
         {"policy",           required_argument, NULL,  6 },      /* Phase 1 (long-only) */
         {"timeout",          required_argument, NULL,  7 },      /* Phase 2 (long-only) */
         {"grace-period",     required_argument, NULL,  8 },      /* Phase 2 (long-only) */
+        {"event-log",        required_argument, NULL,  9 },      /* Phase 3 (long-only) */
+        {"no-event-log",     no_argument,       NULL, 10 },      /* Phase 3 (long-only) */
         {"env",              required_argument, NULL, 'e'},
         {"help",             no_argument,       NULL, 'h'},
         {0, 0, 0, 0}
@@ -349,6 +362,18 @@ static int parse_run_flags(int argc, char *argv[],
                     return 1;
                 }
                 grace_set = true;
+                break;
+            case 9:   /* --event-log <dir> */
+                if (!optarg || optarg[0] == '\0') {
+                    fprintf(stderr, "Invalid --event-log value: "
+                                    "directory must not be empty\n");
+                    return 1;
+                }
+                event_log_path = optarg;
+                event_log_set = true;
+                break;
+            case 10:  /* --no-event-log */
+                no_event_log_set = true;
                 break;
             case 'e':
                 if (*env_count >= MAX_ENV_ENTRIES - 1) {
@@ -461,6 +486,30 @@ static int parse_run_flags(int argc, char *argv[],
                out_cfg->timeout_seconds > 0 &&
                out_cfg->grace_period_seconds == 0) {
         out_cfg->grace_period_seconds = 10;
+    }
+
+    /* Phase 3: event logging.  Explicit CLI flags override policy values
+     * in both directions (enable with a directory / disable entirely).
+     * The default directory is only filled in when logging ends up
+     * enabled and the policy did not provide one. */
+    if (event_log_set && no_event_log_set) {
+        fprintf(stderr,
+                "Error: --event-log and --no-event-log are mutually exclusive\n");
+        return 1;
+    }
+    if (event_log_set) {
+        out_cfg->event_log_enabled = true;
+        strncpy(out_cfg->event_log_dir, event_log_path,
+                sizeof(out_cfg->event_log_dir) - 1);
+        out_cfg->event_log_dir[sizeof(out_cfg->event_log_dir) - 1] = '\0';
+    }
+    if (no_event_log_set) {
+        out_cfg->event_log_enabled = false;
+    }
+    if (out_cfg->event_log_enabled && out_cfg->event_log_dir[0] == '\0') {
+        strncpy(out_cfg->event_log_dir, EVENTLOG_DEFAULT_DIR,
+                sizeof(out_cfg->event_log_dir) - 1);
+        out_cfg->event_log_dir[sizeof(out_cfg->event_log_dir) - 1] = '\0';
     }
 
     /* Cgroup limits merge PER FIELD so e.g. --pids doesn't wipe a
@@ -837,6 +886,11 @@ int cmd_start(int argc, char *argv[]) {
                 "Warning: --timeout is not enforced for detached containers "
                 "(foreground-only; use 'run' instead)\n");
     }
+    if (cfg.event_log_enabled) {
+        fprintf(stderr,
+                "Note: detached containers log container_start only; "
+                "container_exit/timeout_kill are foreground-only\n");
+    }
 
     /* Container env. Phase 8c: bundle process.env first, then CLI --env
      * (CLI precedence).  Non-bundle runs (oci_env_count == 0) keep the
@@ -1200,6 +1254,451 @@ int cmd_cleanup(int argc, char *argv[]) {
 }
 
 /*
+ * Phase 3: shared event-log query helpers.
+ *
+ * The event format is produced by eventlog.c and is deliberately
+ * regular, so these helpers use small key lookups instead of pulling in
+ * a JSON library.  They only need the top-level scalar fields plus
+ * details.user_id, and they fall back to raw output for malformed lines.
+ */
+
+static const char *json_value_for_key(const char *line, const char *key)
+{
+    char needle[80];
+    int n = snprintf(needle, sizeof(needle), "\"%s\"", key);
+    if (n < 0 || (size_t)n >= sizeof(needle)) return NULL;
+
+    const char *p = strstr(line, needle);
+    if (!p) return NULL;
+    p += n;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != ':') return NULL;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    return p;
+}
+
+static int json_hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int json_get_string(const char *line, const char *key,
+                           char *out, size_t out_size)
+{
+    const char *p = json_value_for_key(line, key);
+    if (!p || *p != '"' || out_size == 0) return -1;
+    p++;
+
+    size_t o = 0;
+    while (*p && *p != '"') {
+        char c = *p++;
+        if (c == '\\') {
+            char esc = *p++;
+            switch (esc) {
+                case '"':  c = '"';  break;
+                case '\\': c = '\\'; break;
+                case '/':  c = '/';  break;
+                case 'b':  c = '\b'; break;
+                case 'f':  c = '\f'; break;
+                case 'n':  c = '\n'; break;
+                case 'r':  c = '\r'; break;
+                case 't':  c = '\t'; break;
+                case 'u': {
+                    int h0 = json_hex_value(p[0]);
+                    int h1 = json_hex_value(p[1]);
+                    int h2 = json_hex_value(p[2]);
+                    int h3 = json_hex_value(p[3]);
+                    if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) return -1;
+                    unsigned cp = (unsigned)((h0 << 12) | (h1 << 8) |
+                                             (h2 << 4) | h3);
+                    p += 4;
+                    /* Query fields are ASCII; map anything else to '?'
+                     * rather than attempting surrogate decoding. */
+                    c = (cp < 0x80) ? (char)cp : '?';
+                    break;
+                }
+                case '\0': return -1;
+                default:   c = esc; break;
+            }
+        }
+        if (o + 1 >= out_size) return -1;
+        out[o++] = c;
+    }
+    if (*p != '"') return -1;
+    out[o] = '\0';
+    return 0;
+}
+
+static int json_get_u64(const char *line, const char *key, uint64_t *out)
+{
+    const char *p = json_value_for_key(line, key);
+    if (!p || !out) return -1;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(p, &end, 10);
+    if (end == p || errno == ERANGE) return -1;
+    *out = (uint64_t)v;
+    return 0;
+}
+
+/* Structural check: balanced braces/brackets, strings respected. */
+static bool json_object_looks_valid(const char *line)
+{
+    while (*line == ' ' || *line == '\t' || *line == '\r' || *line == '\n')
+        line++;
+    if (*line != '{') return false;
+
+    int depth = 0;
+    bool in_string = false, escape = false;
+    for (const char *p = line; *p; p++) {
+        char c = *p;
+        if (in_string) {
+            if (escape) escape = false;
+            else if (c == '\\') escape = true;
+            else if (c == '"') in_string = false;
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '{' || c == '[') {
+            depth++;
+        } else if (c == '}' || c == ']') {
+            depth--;
+            if (depth < 0) return false;
+        }
+    }
+    return depth == 0 && !in_string;
+}
+
+static void json_indent(FILE *out, int depth)
+{
+    for (int i = 0; i < depth; i++) fputs("  ", out);
+}
+
+/* Minimal pretty-printer.  Returns -1 when the line does not look like a
+ * JSON object, so the caller can print the raw line instead. */
+static int json_pretty_print_line(const char *line, FILE *out)
+{
+    if (!json_object_looks_valid(line)) return -1;
+
+    int depth = 0;
+    bool in_string = false, escape = false;
+    for (const char *p = line; *p; p++) {
+        char c = *p;
+        if (in_string) {
+            fputc(c, out);
+            if (escape) escape = false;
+            else if (c == '\\') escape = true;
+            else if (c == '"') in_string = false;
+            continue;
+        }
+
+        if (c == '"') {
+            in_string = true;
+            fputc(c, out);
+        } else if (c == '{' || c == '[') {
+            fputc(c, out);
+            depth++;
+            fputc('\n', out);
+            json_indent(out, depth);
+        } else if (c == '}' || c == ']') {
+            depth--;
+            fputc('\n', out);
+            json_indent(out, depth);
+            fputc(c, out);
+        } else if (c == ',') {
+            fputc(',', out);
+            fputc('\n', out);
+            json_indent(out, depth);
+        } else if (c == ':') {
+            fputs(": ", out);
+        } else if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            /* insignificant outside strings */
+        } else {
+            fputc(c, out);
+        }
+    }
+    fputc('\n', out);
+    return 0;
+}
+
+/* Resolve the log directory: CLI override > state metadata > default. */
+static void resolve_event_log_dir(const char *id, const char *override_dir,
+                                  char *out, size_t out_size)
+{
+    if (override_dir && override_dir[0] != '\0') {
+        snprintf(out, out_size, "%s", override_dir);
+        return;
+    }
+
+    container_state_t state;
+    memset(&state, 0, sizeof(state));
+    if (state_load(id, &state) == 0 && state.event_log_dir[0] != '\0') {
+        snprintf(out, out_size, "%s", state.event_log_dir);
+        return;
+    }
+    snprintf(out, out_size, "%s", EVENTLOG_DEFAULT_DIR);
+}
+
+typedef struct {
+    char timestamp[40];
+    char container_id[EVENT_CONTAINER_ID_MAX];
+    char event_type[32];
+} event_row_t;
+
+typedef struct {
+    event_row_t *items;
+    size_t       count;
+    size_t       capacity;
+} event_list_t;
+
+static int event_list_push(event_list_t *list, const event_row_t *row)
+{
+    if (list->count == list->capacity) {
+        size_t next = list->capacity ? list->capacity * 2 : 64;
+        event_row_t *items = realloc(list->items, next * sizeof(*items));
+        if (!items) return -1;
+        list->items = items;
+        list->capacity = next;
+    }
+    list->items[list->count++] = *row;
+    return 0;
+}
+
+/* Read details.user_id from the file's container_start line. */
+static int event_file_user_id(const char *path, uint64_t *uid)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    char line[EVENT_LINE_MAX];
+    int rc = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strstr(line, "\"event_type\":\"container_start\"")) continue;
+        if (json_get_u64(line, "user_id", uid) == 0) {
+            rc = 0;
+            break;
+        }
+    }
+    fclose(f);
+    return rc;
+}
+
+static void collect_event_file(const char *path, bool filter_user,
+                               uint64_t filter_uid, event_list_t *list)
+{
+    if (filter_user) {
+        uint64_t uid = 0;
+        if (event_file_user_id(path, &uid) < 0 || uid != filter_uid) return;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;   /* unreadable / rotated away: skip gracefully */
+
+    char line[EVENT_LINE_MAX];
+    while (fgets(line, sizeof(line), f)) {
+        event_row_t row;
+        memset(&row, 0, sizeof(row));
+        if (json_get_string(line, "timestamp", row.timestamp,
+                            sizeof(row.timestamp)) < 0) continue;
+        if (json_get_string(line, "container_id", row.container_id,
+                            sizeof(row.container_id)) < 0) continue;
+        if (json_get_string(line, "event_type", row.event_type,
+                            sizeof(row.event_type)) < 0) continue;
+        if (event_list_push(list, &row) < 0) break;
+    }
+    fclose(f);
+}
+
+static int event_row_cmp_desc(const void *a, const void *b)
+{
+    const event_row_t *x = (const event_row_t *)a;
+    const event_row_t *y = (const event_row_t *)b;
+    int c = strcmp(y->timestamp, x->timestamp);
+    if (c != 0) return c;
+    c = strcmp(y->container_id, x->container_id);
+    if (c != 0) return c;
+    return strcmp(y->event_type, x->event_type);
+}
+
+/*
+ * Phase 3: `logs <id> [--event-log <dir>]`.
+ * Pretty-prints every JSONL record for one container.  Missing files are
+ * a clear error; malformed lines fall back to raw output.
+ */
+int cmd_logs(int argc, char *argv[])
+{
+    const char *dir_override = NULL;
+    optind = 1;
+    static struct option opts[] = {
+        {"event-log", required_argument, NULL, 'e'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "+e:", opts, NULL)) != -1) {
+        if (opt == 'e' && optarg && optarg[0] != '\0') {
+            dir_override = optarg;
+        } else {
+            fprintf(stderr, "Usage: minicontainer logs [--event-log <dir>] <id>\n");
+            return 1;
+        }
+    }
+    if (optind >= argc) {
+        fprintf(stderr, "Usage: minicontainer logs [--event-log <dir>] <id>\n");
+        return 1;
+    }
+
+    const char *id = argv[optind];
+    char dir[PATH_MAX], path[PATH_MAX];
+    resolve_event_log_dir(id, dir_override, dir, sizeof(dir));
+    if (eventlog_path(dir, id, path, sizeof(path)) < 0) {
+        fprintf(stderr, "Invalid container ID: %s\n", id);
+        return 1;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "No event log for container %s\n", id);
+        return 1;
+    }
+
+    printf("Event log for container %s (%s):\n", id, path);
+    char line[EVENT_LINE_MAX];
+    bool any = false;
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) continue;
+        any = true;
+        if (json_pretty_print_line(line, stdout) < 0) {
+            printf("%s\n", line);
+        }
+        printf("\n");
+    }
+    fclose(f);
+
+    if (!any) {
+        printf("No events logged for container %s\n", id);
+    }
+    return 0;
+}
+
+/*
+ * Phase 3: `events [--user <uid>] [--limit N] [--event-log <dir>]`.
+ * Scans <dir>/*.jsonl, newest first, and prints a compact summary.
+ */
+int cmd_events(int argc, char *argv[])
+{
+    const char *dir_override = NULL;
+    bool filter_user = false;
+    uint64_t filter_uid = 0;
+    size_t limit = 50;
+
+    optind = 1;
+    static struct option opts[] = {
+        {"user",      required_argument, NULL, 'u'},
+        {"limit",     required_argument, NULL, 'n'},
+        {"event-log", required_argument, NULL, 'e'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "+u:n:e:", opts, NULL)) != -1) {
+        if (opt == 'u') {
+            if (!optarg || optarg[0] == '-' || optarg[0] == '\0') {
+                fprintf(stderr, "Invalid --user value: must be a non-negative integer\n");
+                return 1;
+            }
+            errno = 0;
+            char *end = NULL;
+            unsigned long long v = strtoull(optarg, &end, 10);
+            if (errno == ERANGE || end == optarg || *end != '\0') {
+                fprintf(stderr, "Invalid --user value: must be a non-negative integer\n");
+                return 1;
+            }
+            filter_uid = (uint64_t)v;
+            filter_user = true;
+        } else if (opt == 'n') {
+            if (!optarg || optarg[0] == '-' || optarg[0] == '\0') {
+                fprintf(stderr, "Invalid --limit value: must be a positive integer\n");
+                return 1;
+            }
+            errno = 0;
+            char *end = NULL;
+            unsigned long long v = strtoull(optarg, &end, 10);
+            if (errno == ERANGE || end == optarg || *end != '\0' || v == 0) {
+                fprintf(stderr, "Invalid --limit value: must be a positive integer\n");
+                return 1;
+            }
+            limit = (size_t)v;
+        } else if (opt == 'e' && optarg && optarg[0] != '\0') {
+            dir_override = optarg;
+        } else {
+            fprintf(stderr, "Usage: minicontainer events [--user <uid>] "
+                            "[--limit N] [--event-log <dir>]\n");
+            return 1;
+        }
+    }
+    if (optind < argc) {
+        fprintf(stderr, "Usage: minicontainer events [--user <uid>] "
+                        "[--limit N] [--event-log <dir>]\n");
+        return 1;
+    }
+
+    char dir[PATH_MAX];
+    if (dir_override) {
+        snprintf(dir, sizeof(dir), "%s", dir_override);
+    } else {
+        snprintf(dir, sizeof(dir), "%s", EVENTLOG_DEFAULT_DIR);
+    }
+
+    DIR *d = opendir(dir);
+    if (!d) {
+        fprintf(stderr, "No event log directory: %s\n", dir);
+        return 1;
+    }
+
+    event_list_t list = {0};
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        size_t n = strlen(entry->d_name);
+        if (n <= 6 || strcmp(entry->d_name + n - 6, ".jsonl") != 0) continue;
+
+        char path[PATH_MAX];
+        int pn = snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+        if (pn < 0 || (size_t)pn >= sizeof(path)) continue;
+        collect_event_file(path, filter_user, filter_uid, &list);
+    }
+    closedir(d);
+
+    if (list.count == 0) {
+        printf("No events found in %s\n", dir);
+        free(list.items);
+        return 0;
+    }
+
+    qsort(list.items, list.count, sizeof(list.items[0]), event_row_cmp_desc);
+
+    printf("%-24s  %-12s  %s\n", "TIMESTAMP", "CONTAINER", "EVENT");
+    size_t shown = list.count < limit ? list.count : limit;
+    for (size_t i = 0; i < shown; i++) {
+        printf("%-24s  %-12s  %s\n",
+               list.items[i].timestamp,
+               list.items[i].container_id,
+               list.items[i].event_type);
+    }
+    free(list.items);
+    return 0;
+}
+
+/*
  * Phase 1: `policy validate <path>`.
  *
  * Loads and validates a policy without running a container.  Works
@@ -1243,6 +1742,8 @@ void cli_usage(const char *progname) {
     fprintf(stderr, "  list     List running containers\n");
     fprintf(stderr, "  cleanup  Remove stale state from crashed containers\n");
     fprintf(stderr, "  policy   validate <path> — check a policy file without running\n");
+    fprintf(stderr, "  logs     <id> — print a container's event log (--event-log <dir>)\n");
+    fprintf(stderr, "  events   [--user <uid>] [--limit N] — list recent events, newest first\n");
     fprintf(stderr, "  pull     Download a whitelisted rootfs into a bundle (alpine, ubuntu)\n\n");
     fprintf(stderr, "Run-mode options (run | start):\n");
     fprintf(stderr, "  --debug                  Enable debug output\n");
@@ -1270,9 +1771,12 @@ void cli_usage(const char *progname) {
     fprintf(stderr, "  --timeout <seconds>      Wall-clock timeout, 0 = none (run only) (Phase 2)\n");
     fprintf(stderr, "  --grace-period <seconds> SIGTERM->SIGKILL delay, default 10, max %d (Phase 2)\n",
             WATCHDOG_MAX_GRACE_SECONDS);
+    fprintf(stderr, "  --event-log <dir>        Write JSONL audit events to <dir> (Phase 3)\n");
+    fprintf(stderr, "  --no-event-log           Disable event logging for this run (Phase 3)\n");
     fprintf(stderr, "  --env KEY=VALUE          Set environment variable\n");
     fprintf(stderr, "  --help                   Show this help\n\n");
     fprintf(stderr, "Timeout enforcement is foreground-only: `start` warns and ignores --timeout.\n");
+    fprintf(stderr, "Detached `start` records container_start only; exit/timeout events are foreground-only.\n");
     fprintf(stderr, "Backwards compat: %s [options] <command> [args]\n", progname);
     fprintf(stderr, "is equivalent to %s run [options] <command> [args].\n", progname);
 }

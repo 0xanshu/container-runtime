@@ -20,7 +20,20 @@ Built phase by phase, each adding one isolation or production concern: PID / mou
 
 ## Features
 
-### Phase 8c (Current)
+### Secure Workload Execution — Phase 3 (Current)
+
+Phases 1–3 add policy-driven defaults, wall-clock timeouts, and an
+append-only audit log on top of the existing runtime. All three are
+**opt-in**: a legacy invocation with no `--policy`, `--timeout`, or
+`--event-log` behaves exactly as it did in Phase 8c.
+
+- ✅ **JSON policy files — `--policy <path>`** (Phase 1) — a hand-rolled JSON parser and validator covers resource limits (`memory`, `cpu`, `pids`, `timeout`, `grace_period`), warning thresholds, `security.enable_hardening`, and `logging`. JSON is the only supported format; `.toml` paths fail with a clear "not available" message. `minicontainer policy validate <path>` checks a file without starting a container. Unknown top-level sections are warnings, never silently enforced.
+- ✅ **Precedence: defaults < OCI bundle < policy < explicit CLI flags** — `--memory 0`, `--cpus 0`, `--pids 0`, and `--timeout 0` are real overrides that clear a policy/bundle value rather than being ignored. Policy mode is gated separately from legacy mode so existing flag-only invocations never gain a cgroup, watchdog, or log file by accident.
+- ✅ **Wall-clock timeout watchdog — `--timeout` / `--grace-period`** (Phase 2) — a parent-side pthread started after `clone(2)` sends `SIGTERM` at the deadline, waits out the grace period, then escalates to `SIGKILL` (using `cgroup.kill` when a cgroup is present so descendants cannot survive). The same thread polls cgroup v2 for memory/CPU thresholds and OOM events. Timeouts work without a cgroup; monitoring degrades gracefully when cgroup reads fail.
+- ✅ **Append-only JSONL audit log — `--event-log <dir>` / `--no-event-log`** (Phase 3) — one `<container_id>.jsonl` file per container records `container_start`, `container_exit`, `timeout_kill`, `oom_kill`, and `resource_breach`. Writes are `O_APPEND` + one `write(2)`, serialized by a process-local mutex, so watchdog and lifecycle threads never interleave a line. A logging failure warns once, disables logging for that run, and never changes the exit status.
+- ✅ **`logs <id>` / `events [--user <uid>] [--limit N]`** (Phase 3) — `logs` pretty-prints one container's JSONL; `events` scans the log directory and lists the newest events first. Both accept `--event-log <dir>`; `logs` otherwise resolves the directory from the running container's `state.json`, then the default.
+
+### Phase 8c
 
 - ✅ **OCI bundle support — `--bundle <dir>`** — runs an OCI bundle by parsing `<dir>/config.json` (an OCI Runtime Spec subset, ~22 of ~120 fields: `process.args`/`env`/`cwd`/`terminal`/`user`, `root.path`/`readonly`, `hostname`, `mounts`, `linux.namespaces`, `uid`/`gidMappings`, `resources.{memory,cpu,pids}`, `maskedPaths`, `readonlyPaths`) and using `<dir>/rootfs/`. Hand-rolled recursive-descent JSON parser — no jansson/cJSON. `--bundle` is mutually exclusive with `--rootfs`; CLI flags override bundle fields **regardless of argument order** (an argv pre-scan applies the bundle first, then every flag clobbers); a positional command overrides `process.args` (Docker-style). Modules `oci.h`/`oci.c`.
 - ✅ **`pull <tag>` subcommand** — downloads a whitelisted rootfs (`alpine`, `ubuntu`) into a ready-to-run bundle via `curl`/`wget` + `tar`, writing a default `config.json`. A deliberate toy, **not** a registry client — for arbitrary images use `skopeo` + `umoci`. Modules `pull.h`/`pull.c`.
@@ -1243,6 +1256,152 @@ $ echo $?
 
 ---
 
+## Secure Workload Execution (Phases 1–3)
+
+### New CLI surface
+
+| Flag / command | Meaning |
+|---|---|
+| `--policy <path>` | Load a JSON policy and apply its defaults before explicit flags. |
+| `policy validate <path>` | Parse + validate a policy without running a container. |
+| `--timeout <seconds>` | Wall-clock limit; `0` disables it (and clears a policy value). Foreground only. |
+| `--grace-period <seconds>` | Delay between `SIGTERM` and `SIGKILL`; default 10, max 300. |
+| `--event-log <dir>` | Enable JSONL event logging in `<dir>` (overrides a policy's `logging.log_dir`). |
+| `--no-event-log` | Disable event logging for this run, even if the policy enables it. |
+| `logs [--event-log <dir>] <id>` | Print one container's events, pretty-printed. |
+| `events [--user <uid>] [--limit N] [--event-log <dir>]` | List recent events, newest first (default limit 50). |
+
+Explicit flags always win over policy values, including zero values:
+`--memory 0`, `--cpus 0`, `--pids 0`, and `--timeout 0` clear the
+corresponding policy/bundle setting instead of being treated as
+"not supplied".
+
+### Policy file (JSON only)
+
+A policy is a JSON document. Every field is optional; omitted fields use
+the built-in defaults. A minimal file:
+
+```json
+{
+  "policy": {
+    "name": "student",
+    "version": "1.0",
+    "description": "Bounded student workload"
+  },
+  "resources": {
+    "memory": "512M",
+    "cpu": 0.5,
+    "pids": 50,
+    "timeout": 300,
+    "grace_period": 10,
+    "thresholds": {
+      "memory_warning": 0.9,
+      "cpu_warning": 0.8,
+      "cpu_warning_duration": 5,
+      "poll_interval_ms": 100
+    }
+  },
+  "security": {
+    "enable_hardening": true
+  },
+  "logging": {
+    "enabled": true,
+    "log_dir": "/var/log/minicontainer/events"
+  }
+}
+```
+
+Policy defaults (requirements 1.7) are: memory unlimited, CPU `1.0`,
+PIDs `100`, timeout `0`, grace `10`, memory warning `0.9`, CPU warning
+`0.8`, sustained-CPU window `5000 ms`, poll interval `100 ms`, logging
+enabled at `/var/log/minicontainer/events`, and `enable_hardening` true
+(hardening is still gated on a rootfs). Because the default CPU/PID
+values are non-zero, a policy run enables cgroup enforcement unless the
+CLI explicitly clears those values with `--cpus 0 --pids 0`.
+
+JSON is the only supported policy format. A `.toml` path is rejected with
+an explicit "not available" message. Unknown extension keys produce a
+warning and are ignored; they are never enforced.
+
+### Event log format
+
+Each container writes `<log_dir>/<container_id>.jsonl`. Every line is a
+complete JSON object:
+
+```json
+{"timestamp":"2026-10-12T14:32:05.123Z","container_id":"a1b2c3d4e5f6","event_type":"resource_breach","details":{"resource":"memory","current_value":471859200.000000,"limit_value":536870912.000000,"threshold":0.900000,"percentage":0.880000}}
+```
+
+Required event types and their `details` fields:
+
+| Event | Details |
+|---|---|
+| `container_start` | `program`, `argv`, `policy`, `user_id`, `resource_limits` (`memory_bytes`, `cpu`, `pids`, `timeout`) |
+| `container_exit` | `exit_code`, `exit_reason`, `wall_clock_seconds`, `cpu_time_seconds`, `memory_peak_bytes` |
+| `resource_breach` | `resource` (`memory`/`cpu`), `current_value`, `limit_value`, `threshold`, `percentage` |
+| `timeout_kill` | `timeout_seconds`, `elapsed_seconds`, `signal`, `grace_period_used` |
+| `oom_kill` | `memory_limit_bytes`, `memory_peak_bytes`, `exit_code` |
+
+`container_exit` is emitted after the final cgroup sample and before the
+cgroup is removed. Exit-reason precedence is
+`timeout > oom > signal > normal`; a signal death reports
+`exit_code = 128 + signal`.
+
+Default location and permissions:
+
+- Directory: `/var/log/minicontainer/events` (created with `0755`).
+- Files: `<container_id>.jsonl` (created with `0644`; `fchmod` defeats a
+  restrictive umask).
+- Ownership: the user running minicontainer — `root` when cgroup limits
+  are in use, the invoking user for rootless runs.
+- Durability: each event is one `O_APPEND` + one `write(2)`; there is no
+  per-event `fsync`. The OS page cache is the durability boundary, which
+  keeps logging overhead well under the NFR target.
+
+### Retention
+
+The per-container `<container_id>.jsonl` file is the primary rotation
+boundary: a container's events live in exactly one file, and new
+containers get new files. There is no automatic deletion or size-based
+rotation in this delivery. Operators own retention, for example:
+
+```bash
+# Delete event logs older than 30 days.
+find /var/log/minicontainer/events -name '*.jsonl' -mtime +30 -delete
+```
+
+### Querying examples
+
+```bash
+# Policy-driven run with a timeout and a custom log directory.
+$ sudo ./minicontainer run --policy ./student.json --event-log /tmp/events \
+      --timeout 30 /bin/sh -c './workload'
+
+# Watchdog kills it, then inspect the audit trail.
+$ ./minicontainer logs --event-log /tmp/events a1b2c3d4e5f6
+$ ./minicontainer events --event-log /tmp/events --limit 20
+$ ./minicontainer events --user 1000
+```
+
+### Limitations
+
+- **Detached `start` logs `container_start` only.** The parent exits
+  immediately, so no watchdog survives to write `container_exit`,
+  `timeout_kill`, or `resource_breach`. `start` warns about this.
+  Timeout enforcement is foreground-only (`run`).
+- **Cgroup resource limits require root.** `/sys/fs/cgroup` is
+  root-owned; `--user` does not grant write access there. Without a
+  cgroup, timeouts still work and event logging still records
+  start/exit; OOM and `resource_breach` events require cgroup v2.
+- **No policy-extended seccomp, filesystem policy, network policy, or
+  multi-user delegation.** These were explicitly dropped; the existing
+  Phase 8b `--secure` profile is used unchanged. TOML is not supported.
+- **Event logging failure is non-fatal.** If the log directory cannot be
+  created or written, minicontainer prints one warning, disables logging
+  for that run, and continues; the container's exit status is unchanged.
+
+---
+
 ## Testing
 
 ### Unit Tests
@@ -1331,6 +1490,17 @@ Each test_bind case forks into its own `unshare(CLONE_NEWNS)` + `mount("/", MS_R
 **Phase 8c pull tests** (`test_pull` - hermetic, no network, no root):
 - ✓ `cmd_pull` rejects a missing tag, an unknown tag, and an empty tag (the download path is exercised by a live `pull alpine`, not the hermetic suite)
 
+**Secure workload Phase 1 policy tests** (`test_policy` - no root needed):
+- ✓ JSON parsing, validation errors, memory-string syntax, defaults, warning-only extension keys, and `policy_apply` mapping
+- ✓ `tests/test_policy_cli.sh` exercises `policy validate` against valid/invalid fixtures
+
+**Secure workload Phase 2 watchdog tests** (`test_watchdog` - no root needed):
+- ✓ timeout kill, SIGTERM trap, SIGKILL escalation after grace, no-timeout fast path, clean `watchdog_stop`, and fake-cgroup threshold/OOM logic
+
+**Secure workload Phase 3 event tests** (`test_eventlog` - no root needed):
+- ✓ JSONL formatting, escaping, UTC millisecond timestamps, `0755`/`0644` modes, idempotent init, append-not-overwrite, concurrent non-interleaved writes, path-traversal rejection, truncation fallback, and constructor fields
+- ✓ `tests/integration/test_event_logging.sh`, `test_timeout_event.sh`, `test_logs_command.sh`, `test_event_log_failure.sh` cover the CLI and lifecycle; `test_oom_event.sh` / `test_resource_breach.sh` SKIP unless run as root on cgroup v2
+
 ### Manual Testing
 
 ```bash
@@ -1378,6 +1548,17 @@ sudo ./minicontainer --pid /bin/sh -c 'echo $$'
 # Exit codes
 sudo ./minicontainer --pid /bin/sh -c 'exit 42'
 echo $?  # Should be 42
+
+# Secure workload phases: policy + timeout + JSONL events
+sudo ./minicontainer run --policy tests/fixtures/policies/valid.json \
+    --event-log /tmp/mc-events --timeout 5 /bin/sh -c 'sleep 30'
+echo $?                       # 137 or 143 after the timeout
+ls /tmp/mc-events/*.jsonl     # container_start, timeout_kill, container_exit
+./minicontainer logs --event-log /tmp/mc-events <id>
+./minicontainer events --event-log /tmp/mc-events --limit 5
+
+# Event-log failure must not fail the container (exit 0, one warning)
+./minicontainer run --event-log /dev/null/events /bin/true
 ```
 
 ### Memory Leak Detection

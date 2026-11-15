@@ -43,7 +43,7 @@ HELPER_OBJS = $(BUILD_DIR)/core.o $(BUILD_DIR)/env.o \
               $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/oci.o $(BUILD_DIR)/pull.o \
               $(BUILD_DIR)/policy.o $(BUILD_DIR)/policy_json.o \
-              $(BUILD_DIR)/watchdog.o
+              $(BUILD_DIR)/watchdog.o $(BUILD_DIR)/eventlog.o
 
 # Executables
 MINICONTAINER  = minicontainer
@@ -62,6 +62,7 @@ TEST_OCI       = test_oci
 TEST_PULL      = test_pull
 TEST_POLICY    = test_policy
 TEST_WATCHDOG  = test_watchdog
+TEST_EVENTLOG  = test_eventlog
 
 # Default target
 .PHONY: all
@@ -165,11 +166,16 @@ $(TEST_WATCHDOG): $(BUILD_DIR)/test_watchdog.o $(HELPER_OBJS) $(LIBPROCFS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_WATCHDOG) successfully!"
 
+# Phase 3: event formatting/persistence/concurrency tests (no root required)
+$(TEST_EVENTLOG): $(BUILD_DIR)/test_eventlog.o $(HELPER_OBJS) $(LIBPROCFS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	@echo "Built $(TEST_EVENTLOG) successfully!"
+
 # Build and run all tests
 .PHONY: test
 test: $(MINICONTAINER) $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TEST_NET) \
       $(TEST_STATE) $(TEST_BIND) $(TEST_CLI) $(TEST_HARDENING) $(TEST_INIT) $(TEST_OCI) \
-      $(TEST_PULL) $(TEST_POLICY) $(TEST_WATCHDOG)
+      $(TEST_PULL) $(TEST_POLICY) $(TEST_WATCHDOG) $(TEST_EVENTLOG)
 	@echo "=== Running Phase 7a core tests (bare_exec + pid_only, requires root) ==="
 	sudo ./$(TEST_CORE)
 	@echo ""
@@ -231,6 +237,19 @@ test: $(MINICONTAINER) $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(
 	bash tests/integration/test_timeout_grace.sh
 	bash tests/integration/test_timeout_detached.sh
 	bash tests/integration/test_timeout_stress.sh
+	@echo ""
+	@echo "=== Running Phase 3 eventlog tests (no root required) ==="
+	./$(TEST_EVENTLOG)
+	@echo ""
+	@echo "=== Running Phase 3 event logging integration tests (no root required) ==="
+	bash tests/integration/test_event_logging.sh
+	bash tests/integration/test_timeout_event.sh
+	bash tests/integration/test_logs_command.sh
+	bash tests/integration/test_event_log_failure.sh
+	@echo ""
+	@echo "=== Running Phase 3 cgroup-dependent event tests (root + cgroup v2; SKIP otherwise) ==="
+	bash tests/integration/test_oom_event.sh
+	bash tests/integration/test_resource_breach.sh
 
 # Build with debug symbols
 .PHONY: debug
@@ -299,7 +318,7 @@ clean:
 	@rm -rf $(BUILD_DIR)
 	@rm -f $(MINICONTAINER) $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TEST_NET) \
 	       $(TEST_STATE) $(TEST_BIND) $(TEST_CLI) $(TEST_HARDENING) $(TEST_INIT) $(TEST_OCI) $(TEST_PULL) \
-	       $(TEST_POLICY) $(TEST_WATCHDOG)
+	       $(TEST_POLICY) $(TEST_WATCHDOG) $(TEST_EVENTLOG)
 	@echo "Cleaned build artifacts"
 
 # Run example commands

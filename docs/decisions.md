@@ -13,6 +13,7 @@
 3. [Errors Found and Fixed](#errors-found-and-fixed)
 4. [Known Limitations](#known-limitations)
 5. [Future Considerations](#future-considerations)
+6. [Secure Workload Execution — Phases 1–3](#secure-workload-execution--phases-13)
 
 ---
 
@@ -4025,6 +4026,136 @@ the specific PID, not a namespace-wide listing).
 
 - Memory leak detection (valgrind)
 - Error path coverage
+
+---
+
+## Secure Workload Execution — Phases 1–3
+
+The feature adds three opt-in layers on top of Phase 8c: a JSON policy
+file, a parent-side timeout/resource watchdog, and a JSONL event log.
+The guiding rule for all three was **legacy behavior is unchanged**. A
+run without `--policy`, `--timeout`, or `--event-log` takes exactly the
+Phase 8c path and creates no extra files.
+
+### 40. Policy format: JSON only, raw parser, validation before application
+
+`--policy` accepts JSON only. TOML is rejected with a clear error rather
+than silently half-parsed. The parser is a small recursive-descent reader
+(no jansson/cJSON), matching the project's existing hand-rolled JSON
+approach for state files and OCI configs. Policies are validated before
+any field reaches `container_config_t`; `policy validate` exposes the same
+path without launching a container.
+
+Unknown extension keys are warnings. They are printed to stderr, recorded
+in the warning list, and ignored — never enforced. That keeps the file
+forward-compatible without letting an unread key change runtime behavior.
+
+### 41. Precedence: defaults < OCI bundle < policy < explicit CLI flags
+
+`parse_run_flags` pre-scans a bundle, then loads the policy, then merges
+CLI flags last. Presence tracking is load-bearing: `--memory 0`,
+`--cpus 0`, `--pids 0`, and `--timeout 0` must clear a policy/bundle value
+instead of being confused with "flag absent". The cgroup enable bit is
+recomputed from the effective values, so clearing every limit disables the
+cgroup rather than leaving an empty one.
+
+Policy defaults are intentionally non-zero for CPU (`1.0`) and PIDs
+(`100`). A policy run therefore enables cgroup enforcement unless the
+operator explicitly clears those fields. This matches requirements 1.7
+and keeps a policy useful without a long file, at the cost of requiring
+root for a bare policy run.
+
+### 42. Policy mode is a separate gate from legacy mode
+
+`container_config_t.policy_mode` is set only by `policy_apply`. It is
+not used to skip validation; it is used to distinguish "a policy supplied
+this timeout but no grace period" from "a legacy `--timeout` supplied no
+grace period". Legacy runs still get the documented 10-second grace
+default. Policy runs keep the policy's grace value, including 0.
+
+Event logging follows the same rule: `event_log_enabled` is zero for a
+legacy run, so no directory is created and no line is written unless a
+policy or `--event-log` asked for it.
+
+### 43. Watchdog lifetime and ownership
+
+The watchdog is allocated with `calloc`, populated before
+`watchdog_start`, and stored on `container_result_t.watchdog`. It is
+started only after `clone(2)` and all post-clone wiring (user-ns map,
+network, cgroup membership, sync write, PTY handoff) succeed, because the
+child would otherwise inherit a copy of the pthread state. It is stopped
+immediately after `wait4` returns and finalized before the cgroup is
+removed. `container_cleanup` frees it.
+
+A watchdog start failure is non-fatal: the container runs without a
+timeout or monitoring. A missing cgroup degrades cgroup reads to no-ops;
+timeout enforcement still works.
+
+### 44. Event details are preformatted JSON; append is one write
+
+`event_t` carries a `details[2048]` object string and a preformatted
+`json_line[8192]`. Constructors build the details with a bounded JSON
+builder and preformat the full line. `eventlog_append` opens with
+`O_APPEND`, performs exactly one `write(2)` (retrying only on `EINTR`),
+and treats a short write as failure. A process-local mutex serializes the
+watchdog and lifecycle threads even on filesystems where `O_APPEND` is
+weaker. Constructors that overflow fall back to the valid object
+`{"truncated":true}` rather than emitting a malformed half-line.
+
+There is no per-event `fsync`. The NFR target (<1% overhead) outweighs
+per-line durability; the OS page cache is the durability boundary. This
+is documented in the README rather than hidden.
+
+`eventlog_init` uses `mkdir_p(..., 0755)`, creates the file with `0644`,
+and calls `fchmod` so a restrictive umask cannot silently narrow
+permissions. IDs containing `/`, `\`, or `..` are rejected, so CLI input
+cannot escape the log directory.
+
+### 45. Exit reason precedence and event ownership
+
+`container_wait` owns `oom_kill` and `container_exit`; the watchdog owns
+`timeout_kill` and `resource_breach`. Precedence is
+`timeout > oom > signal > normal`. The exit event is written after the
+final cgroup sample (`memory.peak`, `cpu.stat`, `memory.events`) and
+before `container_cleanup` removes the cgroup. Signal deaths report
+`128 + signal`.
+
+Logging failures warn once, disable logging for the rest of the run, and
+never change the exit status. The watchdog's failure flag is propagated
+to the result so `container_wait` does not print a second warning.
+
+### 46. Detached `start` and retention boundary
+
+A detached `start` exits immediately, so no parent-side watchdog survives
+to write `container_exit`, `timeout_kill`, or `resource_breach`. It logs
+`container_start` only and warns on stderr. This is documented as a
+foreground-only limitation rather than pretending detached timeouts work.
+
+The per-container `<container_id>.jsonl` file is the rotation boundary.
+There is no automatic deletion or size-based rotation in this delivery;
+operators prune files with `find ... -mtime +N -delete` or an equivalent
+policy. This avoids silently growing an unbounded global log while
+keeping the implementation small.
+
+### Dropped scope
+
+The following remain out of scope and are documented in the README:
+policy-extended seccomp entries, filesystem/network policy, multi-user or
+delegated cgroups, and TOML support. The existing Phase 8b `--secure`
+profile is used unchanged.
+
+### Error #28: Watchdog event log used the config directory instead of the resolved default
+
+`container_start` resolves the effective log directory once (CLI/policy
+value, otherwise `EVENTLOG_DEFAULT_DIR`) into `container_result_t`.
+The watchdog context was populated from `config->event_log_dir` instead.
+For a policy that enabled logging without an explicit `log_dir`, the
+config field could still be empty while the result used the default, so
+the watchdog silently skipped `timeout_kill` and `resource_breach` even
+though `container_start` had written successfully. Fixed by copying
+`result.event_log_dir` into `wd->event_log_dir`. Caught by static review
+of the Phase 3 integration path; the eventlog unit tests do not exercise
+the cross-module handoff.
 
 ---
 

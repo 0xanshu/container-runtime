@@ -17,6 +17,7 @@
 //     watchdog_get_stats()/watchdog_stop().
 
 #include "watchdog.h"
+#include "eventlog.h" /* Phase 3: JSONL timeout/resource events */
 #include "cgroups.h"   /* read_cgroup_stats() from libprocfs */
 
 #include <errno.h>
@@ -34,10 +35,17 @@
 #define WD_MAX_POLL_EVENTS 4
 
 /* One deferred event-callback invocation.  Built while the context lock
- * is held, emitted after it is released. */
+ * is held, emitted after it is released.  Structured fields feed the
+ * Phase 3 JSONL constructors; `details` remains the human-readable
+ * string for the legacy callback hook. */
 typedef struct {
     const char *type;
     char        details[256];
+    char        resource[16];
+    double      current_value;
+    double      limit_value;
+    double      threshold;
+    double      percentage;
 } wd_event_t;
 
 /* ------------------------------------------------------------------ */
@@ -188,12 +196,22 @@ static void wd_refresh_stats_locked(watchdog_context_t *ctx)
 /* Threshold logic (caller holds ctx->mutex)                           */
 /* ------------------------------------------------------------------ */
 
-static void wd_event_add(wd_event_t *events, int *count, int max,
-                         const char *type, const char *fmt, ...)
+static void wd_event_add_resource(wd_event_t *events, int *count, int max,
+                                  const char *resource, double current_value,
+                                  double limit_value, double threshold,
+                                  double percentage,
+                                  const char *fmt, ...)
 {
     if (*count >= max) return;
     wd_event_t *ev = &events[*count];
-    ev->type = type;
+    memset(ev, 0, sizeof(*ev));
+    ev->type = "resource_breach";
+    snprintf(ev->resource, sizeof(ev->resource), "%s", resource);
+    ev->current_value = current_value;
+    ev->limit_value   = limit_value;
+    ev->threshold     = threshold;
+    ev->percentage    = percentage;
+
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(ev->details, sizeof(ev->details), fmt, ap);
@@ -223,8 +241,12 @@ static void wd_poll_locked(watchdog_context_t *ctx,
             if (!ctx->memory_breach_logged) {
                 ctx->memory_breach_logged = true;
                 ctx->memory_breach_count++;
-                wd_event_add(events, event_count, max_events,
-                             "resource_breach",
+                wd_event_add_resource(events, event_count, max_events,
+                             "memory",
+                             (double)ctx->memory_current_bytes,
+                             (double)ctx->memory_max_bytes,
+                             ctx->memory_warning_threshold,
+                             ratio,
                              "resource=memory current=%llu limit=%llu "
                              "threshold=%.2f percentage=%.3f",
                              (unsigned long long)ctx->memory_current_bytes,
@@ -266,8 +288,9 @@ static void wd_poll_locked(watchdog_context_t *ctx,
                         !ctx->cpu_breach_logged) {
                         ctx->cpu_breach_logged = true;
                         ctx->cpu_breach_count++;
-                        wd_event_add(events, event_count, max_events,
-                                     "resource_breach",
+                        wd_event_add_resource(events, event_count, max_events,
+                                     "cpu", cpu, 1.0,
+                                     ctx->cpu_warning_threshold, cpu,
                                      "resource=cpu cpu=%.3f threshold=%.2f "
                                      "held=%llums",
                                      cpu, ctx->cpu_warning_threshold,
@@ -286,13 +309,53 @@ static void wd_poll_locked(watchdog_context_t *ctx,
     }
 }
 
+/* Phase 3: an append failure is non-fatal (NFR2).  Warn once, disable
+ * this watchdog's event logging, and keep monitoring. */
+static void wd_event_log_fail(watchdog_context_t *ctx, const char *operation,
+                              int err)
+{
+    bool warn_once = false;
+    bool locked = ctx->mutex_initialized;
+    if (locked) pthread_mutex_lock(&ctx->mutex);
+    if (!ctx->event_log_failed) {
+        ctx->event_log_failed = true;
+        warn_once = true;
+    }
+    ctx->event_log_enabled = false;
+    if (locked) pthread_mutex_unlock(&ctx->mutex);
+
+    if (warn_once) {
+        fprintf(stderr,
+                "[eventlog] warning: %s append failed for container %s: %s; "
+                "event logging disabled for this run\n",
+                operation,
+                ctx->container_id[0] ? ctx->container_id : "(unknown)",
+                strerror(err ? err : EIO));
+    }
+}
+
 static void wd_emit_events(watchdog_context_t *ctx,
                            const wd_event_t *events, int count)
 {
-    if (!ctx->event_cb) return;
     for (int i = 0; i < count; i++) {
-        ctx->event_cb(events[i].type, events[i].details,
-                      ctx->event_userdata);
+        if (ctx->event_log_enabled && ctx->container_id[0] &&
+            ctx->event_log_dir[0]) {
+            event_t event;
+            event_resource_breach(&event, ctx->container_id,
+                                  events[i].resource,
+                                  events[i].current_value,
+                                  events[i].limit_value,
+                                  events[i].threshold,
+                                  events[i].percentage);
+            if (eventlog_append(ctx->event_log_dir, ctx->container_id,
+                                &event) < 0) {
+                wd_event_log_fail(ctx, "resource_breach", errno);
+            }
+        }
+        if (ctx->event_cb) {
+            ctx->event_cb(events[i].type, events[i].details,
+                          ctx->event_userdata);
+        }
     }
 }
 
@@ -407,13 +470,25 @@ static void wd_initiate_timeout_kill(watchdog_context_t *ctx)
                 (unsigned)grace_seconds);
     }
 
+    const char *signal_name = used_grace ? "SIGKILL" : "SIGTERM";
+
+    if (ctx->event_log_enabled && ctx->container_id[0] &&
+        ctx->event_log_dir[0]) {
+        event_t event;
+        event_timeout_kill(&event, ctx->container_id, timeout_seconds,
+                           elapsed, signal_name, used_grace);
+        if (eventlog_append(ctx->event_log_dir, ctx->container_id,
+                            &event) < 0) {
+            wd_event_log_fail(ctx, "timeout_kill", errno);
+        }
+    }
+
     if (ctx->event_cb) {
         char details[256];
         snprintf(details, sizeof(details),
                  "timeout_seconds=%u elapsed_seconds=%.3f signal=%s "
                  "grace_period_used=%s",
-                 (unsigned)timeout_seconds, elapsed,
-                 used_grace ? "SIGKILL" : "SIGTERM",
+                 (unsigned)timeout_seconds, elapsed, signal_name,
                  used_grace ? "true" : "false");
         ctx->event_cb("timeout_kill", details, ctx->event_userdata);
     }
@@ -667,6 +742,7 @@ void watchdog_get_stats(const watchdog_context_t *ctx, watchdog_stats_t *out)
     out->grace_period_used     = ctx->grace_period_used;
     out->timeout_race_resolved = ctx->timeout_race_resolved;
     out->oom_detected          = ctx->oom_detected;
+    out->event_log_failed      = ctx->event_log_failed;
     out->error_code            = ctx->error_code;
     memcpy(out->error_message, ctx->error_message,
            sizeof(out->error_message));

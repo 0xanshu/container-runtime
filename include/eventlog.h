@@ -31,6 +31,11 @@
 #define EVENT_LINE_MAX         8192
 #define EVENT_ERROR_MAX        256
 
+/* Default directory used when policy logging is enabled without an
+ * explicit log_dir (requirements 3.3).  Kept in sync with
+ * POLICY_DEFAULT_LOG_DIR in policy.h. */
+#define EVENTLOG_DEFAULT_DIR   "/var/log/minicontainer/events"
+
 typedef enum {
     EVENT_CONTAINER_START = 0,
     EVENT_CONTAINER_EXIT,

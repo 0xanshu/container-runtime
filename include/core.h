@@ -5,7 +5,9 @@
 
 #include <sched.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <sys/types.h>
+#include <time.h>
 #include "cgroup.h"   // cgroup_limits_t, cgroup_context_t
 #include "overlay.h"  // overlay_context_t
 #include "net.h"      // veth_config_t, net_context_t
@@ -151,6 +153,25 @@ typedef struct {
      * runs with a timeout and/or resource monitoring).  Owned by the
      * result; container_cleanup() stops and frees it. */
     struct watchdog_context *watchdog;
+
+    /* Phase 3 — event logging + final accounting.  Zero-init friendly:
+     * event_log_enabled is false for every legacy run, so no file is
+     * created and no event is emitted unless --policy/--event-log asked
+     * for it.  container_start() fills the identity fields, the
+     * monotonic start time, and container_start();
+     * container_wait() fills the outcome fields and emits
+     * oom_kill/container_exit before the cgroup is removed. */
+    char        container_id[CONTAINER_ID_LEN + 1];
+    char        policy_name[64];
+    char        event_log_dir[PATH_MAX];
+    bool        event_log_enabled;
+    bool        event_log_warned;       /* warning already printed */
+    bool        oom_detected;
+    struct timespec start_time;         /* CLOCK_MONOTONIC, set at clone */
+    double      wall_clock_seconds;
+    double      cpu_time_seconds;
+    uint64_t    memory_peak_bytes;
+    uint64_t    memory_limit_bytes;
 } container_result_t;
 
 /**

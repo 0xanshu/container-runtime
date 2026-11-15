@@ -103,6 +103,7 @@ typedef struct watchdog_context {
     uint64_t memory_breach_count;
     uint64_t cpu_breach_count;
     uint64_t oom_kill_count;
+    bool     event_log_failed;           /* Phase 3: append failed */
     int      error_code;
     char     error_message[WATCHDOG_ERROR_MAX];
 
@@ -133,6 +134,7 @@ typedef struct {
     bool grace_period_used;
     bool timeout_race_resolved;
     bool oom_detected;
+    bool event_log_failed;
 
     int  error_code;
     char error_message[WATCHDOG_ERROR_MAX];
