@@ -310,10 +310,10 @@ static int test_eventlog_path(void)
 
 static int test_init_modes_and_idempotence(void)
 {
-    char base[PATH_MAX];
+    char base[512];
     CHECK(make_temp_dir(base, sizeof(base)) == 0, "mkdtemp failed");
 
-    char dir[PATH_MAX], file[PATH_MAX];
+    char dir[1024], file[2048];
     int n = snprintf(dir, sizeof(dir), "%s/nested/events", base);
     CHECK(n > 0 && (size_t)n < sizeof(dir), "dir path truncated");
     n = snprintf(file, sizeof(file), "%s/abc123.jsonl", dir);
@@ -341,10 +341,10 @@ static int test_init_modes_and_idempotence(void)
 
 static int test_append_creates_second_line(void)
 {
-    char base[PATH_MAX];
+    char base[512];
     CHECK(make_temp_dir(base, sizeof(base)) == 0, "mkdtemp failed");
 
-    char dir[PATH_MAX], file[PATH_MAX];
+    char dir[1024], file[2048];
     snprintf(dir, sizeof(dir), "%s/events", base);
     snprintf(file, sizeof(file), "%s/id1.jsonl", dir);
 
@@ -369,7 +369,7 @@ static int test_append_creates_second_line(void)
     free(text);
 
     /* append() alone creates the file (init is advisory, not required). */
-    char file2[PATH_MAX];
+    char file2[2048];
     snprintf(file2, sizeof(file2), "%s/id2.jsonl", dir);
     event_container_start(&event, "id2", "/bin/true", NULL, "none", 0,
                           0, 0.0, 0, 0);
@@ -404,10 +404,10 @@ static void *concurrent_appender(void *raw)
 
 static int test_concurrent_appends(void)
 {
-    char base[PATH_MAX];
+    char base[512];
     CHECK(make_temp_dir(base, sizeof(base)) == 0, "mkdtemp failed");
 
-    char dir[PATH_MAX], file[PATH_MAX];
+    char dir[1024], file[2048];
     snprintf(dir, sizeof(dir), "%s/events", base);
     snprintf(file, sizeof(file), "%s/conc123.jsonl", dir);
     CHECK(eventlog_init(dir, "conc123") == 0, "eventlog_init failed");
@@ -459,10 +459,10 @@ static int test_concurrent_appends(void)
 
 static int test_failures_are_clean(void)
 {
-    char base[PATH_MAX];
+    char base[512];
     CHECK(make_temp_dir(base, sizeof(base)) == 0, "mkdtemp failed");
 
-    char blocker[PATH_MAX], dir[PATH_MAX];
+    char blocker[1024], dir[2048];
     snprintf(blocker, sizeof(blocker), "%s/not-a-directory", base);
     int fd = open(blocker, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     CHECK(fd >= 0, "could not create blocker file");

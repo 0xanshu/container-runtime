@@ -223,6 +223,17 @@ If you move or rename the built binary afterward, re-run
 `make install-apparmor` so the profile's path matches. Other distros
 (earlier Ubuntu, Fedora, Arch, RHEL/Rocky) don't need this step.
 
+### Live Showcase / Demo
+
+To see all 10 isolation and security layers in action (namespaces, rootfs, OverlayFS, cgroups, watchdog timeout, JSON policy enforcement, JSONL audit logs, detached lifecycle, and capability/seccomp hardening):
+
+```bash
+make                 # builds ./minicontainer
+./run_demo.sh        # runs 10-step guided demo (auto-elevates to sudo if needed)
+```
+
+See [docs/DEMO.md](docs/DEMO.md) for a section-by-section walkthrough, expected output, and troubleshooting.
+
 ### Run
 
 #### Phase 7b — Subcommand lifecycle
@@ -1257,6 +1268,8 @@ $ echo $?
 ---
 
 ## Secure Workload Execution (Phases 1–3)
+
+> A complete end-to-end demo of policy enforcement, watchdog timeouts, and JSONL audit logging is available via `./run_demo.sh` (see [docs/DEMO.md](docs/DEMO.md)).
 
 ### New CLI surface
 
